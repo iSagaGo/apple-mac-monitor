@@ -51,5 +51,3 @@ repo-name-overrides.json
 # <<< codex git-sync <<<
 
 !server/.env.example
-
-
