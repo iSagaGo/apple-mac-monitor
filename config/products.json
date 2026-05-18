@@ -1,0 +1,18 @@
+{
+  "intervalSeconds": 10,
+  "repeatAlertAfterSeconds": 60,
+  "requestTimeoutSeconds": 20,
+  "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleStockMonitor/1.0",
+  "notifications": {
+    "desktop": true,
+    "beep": true,
+    "openBrowser": true
+  },
+  "products": [
+    {
+      "name": "Apple refurbished Mac target",
+      "url": "https://www.apple.com.cn/shop/product/g1cepch/a",
+      "enabled": true
+    }
+  ]
+}

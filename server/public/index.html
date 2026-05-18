@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Apple Mac 翻新机监控</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Apple Refurb Monitor</p>
+          <h1>Mac Studio 库存监控</h1>
+        </div>
+        <div class="actions">
+          <button id="refreshButton" class="ghost" type="button">刷新</button>
+          <button id="ruleButton" class="ghost" type="button">提醒筛选</button>
+          <button id="sourceButton" class="ghost" type="button">扫描来源</button>
+          <button id="scanButton" type="button">立即扫描</button>
+        </div>
+      </header>
+
+      <section class="grid">
+        <section class="panel wide">
+          <div class="panel-head">
+            <h2>运行状态</h2>
+            <span id="lastUpdated" class="status muted">等待数据</span>
+          </div>
+          <section class="metrics status-metrics" aria-label="监控指标">
+            <div class="metric">
+              <span>最近商品</span>
+              <strong id="offerCount">0</strong>
+            </div>
+            <div class="metric">
+              <span>提醒窗口</span>
+              <strong id="windowCount">0</strong>
+            </div>
+            <div class="metric">
+              <span>短信事件</span>
+              <strong id="smsCount">0</strong>
+            </div>
+            <div class="metric">
+              <span>TG 事件</span>
+              <strong id="telegramCount">0</strong>
+            </div>
+          </section>
+          <div class="status-strip">
+            <div>
+              <span>扫描间隔</span>
+              <strong>10s</strong>
+            </div>
+            <div>
+              <span>规则</span>
+              <strong id="activeRuleCount">1</strong>
+            </div>
+            <div>
+              <span>扫描状态</span>
+              <strong id="lastScanState">等待</strong>
+            </div>
+          </div>
+          <div id="scanMessage" class="scan-message"></div>
+        </section>
+      </section>
+
+      <section class="panel core-products-panel">
+        <div class="panel-head">
+          <h2>核心商品</h2>
+          <span class="status muted">仅独立监控页面商品</span>
+        </div>
+        <div class="table-wrap">
+          <table class="product-table">
+            <colgroup>
+              <col class="col-status" />
+              <col class="col-product" />
+              <col class="col-config" />
+              <col class="col-price" />
+              <col class="col-seen" />
+            </colgroup>
+            <thead>
+              <tr>
+                <th>状态</th>
+                <th>商品</th>
+                <th>配置</th>
+                <th>价格</th>
+                <th>最后扫描</th>
+              </tr>
+            </thead>
+            <tbody id="coreOffersBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="recentProductsPanel" class="panel recent-products-panel" hidden>
+        <div class="panel-head">
+          <h2>最近商品</h2>
+          <span class="status muted">按最后扫描时间排序</span>
+        </div>
+        <div class="table-wrap">
+          <table class="product-table">
+            <colgroup>
+              <col class="col-status" />
+              <col class="col-product" />
+              <col class="col-config" />
+              <col class="col-price" />
+              <col class="col-seen" />
+            </colgroup>
+            <thead>
+              <tr>
+                <th>状态</th>
+                <th>商品</th>
+                <th>配置</th>
+                <th>价格</th>
+                <th>最后扫描</th>
+              </tr>
+            </thead>
+            <tbody id="offersBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>提醒窗口</h2>
+          <span class="status muted">去重后的有货周期</span>
+        </div>
+        <div id="windows" class="window-list"></div>
+      </section>
+    </main>
+
+    <dialog id="ruleDialog" class="modal">
+      <form id="ruleForm" method="dialog">
+        <div class="modal-head">
+          <div>
+            <p class="eyebrow">Alert Rule</p>
+            <h2>提醒筛选</h2>
+          </div>
+          <button id="ruleCloseButton" class="icon-button" type="button" aria-label="关闭">×</button>
+        </div>
+        <label>
+          规则 ID
+          <input id="ruleId" name="ruleId" autocomplete="off" />
+        </label>
+        <label>
+          机型
+          <input id="ruleModel" name="ruleModel" autocomplete="off" />
+        </label>
+        <label>
+          内存
+          <input id="ruleMemory" name="ruleMemory" placeholder="512gb,256gb" autocomplete="off" />
+        </label>
+        <label>
+          存储容量
+          <input id="ruleStorage" name="ruleStorage" placeholder="16tb,8tb" autocomplete="off" />
+        </label>
+        <label>
+          最高价格
+          <input id="ruleMaxPrice" name="ruleMaxPrice" type="number" inputmode="numeric" min="0" step="1" placeholder="100000" />
+        </label>
+        <label>
+          二次提醒阈值秒
+          <input id="ruleRepeatAfter" name="ruleRepeatAfter" type="number" inputmode="numeric" min="1" step="1" placeholder="1800" />
+        </label>
+        <div class="modal-actions">
+          <span id="saveStatus" class="status muted">未保存变更</span>
+          <button type="submit">保存筛选</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="sourceDialog" class="modal">
+      <form id="sourceForm" method="dialog">
+        <div class="modal-head">
+          <div>
+            <p class="eyebrow">Scan Sources</p>
+            <h2>扫描来源</h2>
+          </div>
+          <button id="sourceCloseButton" class="icon-button" type="button" aria-label="关闭">×</button>
+        </div>
+        <label>
+          全局抓取页面
+          <textarea id="listingUrlsInput" rows="4" spellcheck="false"></textarea>
+        </label>
+        <label>
+          独立监控页面
+          <textarea id="manualUrlsInput" rows="4" spellcheck="false"></textarea>
+        </label>
+        <div class="modal-actions">
+          <span id="sourceStatus" class="status muted">每行一个 Apple 链接</span>
+          <button type="submit">保存</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

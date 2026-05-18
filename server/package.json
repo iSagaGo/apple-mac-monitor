@@ -1,0 +1,16 @@
+{
+  "name": "apple-mac-monitor-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test",
+    "start": "node src/index.js",
+    "scan:once": "node src/scanner.js --once",
+    "backup": "node src/backup.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.9.1",
+    "undici": "^6.25.0"
+  }
+}
