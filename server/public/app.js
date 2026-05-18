@@ -132,7 +132,7 @@ function offerRowHtml(offer) {
   const config = [offer.chip, offer.memoryText || offer.memory, offer.storageText || offer.storage]
     .filter(Boolean)
     .join(' / ');
-  const href = offer.canonicalUrl || offer.url || '#';
+  const href = safeAppleHref(offer.canonicalUrl || offer.url || '#');
   const productName = offer.title || offer.model || offer.productId || '查看商品';
   const productMeta = [offer.productId, offer.model && offer.model !== productName ? offer.model : null]
     .filter(Boolean)

@@ -54,6 +54,7 @@ function loadDashboardScript(overrides = {}) {
     clearTimeout(id) {
       timeouts[id - 1] = null;
     },
+    URL,
     window: { addEventListener() {} },
     __elements: elements,
     __intervals: intervals,
@@ -278,6 +279,26 @@ test('dashboard renders the product name as the Apple product link', () => {
   const html = sandbox.__elements.get('#offersBody').innerHTML;
   assert.match(html, /<a href="https:\/\/www\.apple\.com\.cn\/shop\/product\/g1cepch\/a"[^>]*>Mac Studio 512GB<\/a>/);
   assert.doesNotMatch(html, />G1CEPCH\/A<\/a>/);
+});
+
+test('dashboard only renders Apple product URLs as clickable product links', () => {
+  const sandbox = loadDashboardScript();
+
+  sandbox.renderOffers([
+    {
+      availabilityStatus: 'available',
+      canonicalUrl: 'javascript:alert(1)',
+      lastSeenAt: '2026-05-18T21:20:08.882+08:00',
+      model: 'Mac Studio',
+      title: 'Mac Studio 512GB',
+      price: { amount: '12345' },
+      productId: 'G1CEPCH/A',
+    },
+  ]);
+
+  const html = sandbox.__elements.get('#offersBody').innerHTML;
+  assert.match(html, /<a href="#"[^>]*>Mac Studio 512GB<\/a>/);
+  assert.doesNotMatch(html, /javascript:alert/);
 });
 
 test('dashboard renders core products in a separate section before recent products', () => {

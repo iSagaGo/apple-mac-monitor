@@ -396,8 +396,16 @@ function createRepository(db) {
   `);
   const listLocalEvents = db.prepare(`
     select * from local_events
+      where status = @status
       order by created_at desc, id desc
       limit @limit
+  `);
+  const markLocalEvent = db.prepare(`
+    update local_events
+      set status = @status,
+          delivered_at = @deliveredAt,
+          error = @error
+      where id = @id
   `);
   const startScanRun = db.prepare(`
     insert into scan_runs (started_at, status, source, created_at)
@@ -562,8 +570,8 @@ function createRepository(db) {
       });
     },
 
-    listLocalEvents({ limit = 100 } = {}) {
-      return listLocalEvents.all({ limit }).map((row) => ({
+    listLocalEvents({ limit = 100, status = 'pending' } = {}) {
+      return listLocalEvents.all({ limit, status }).map((row) => ({
         id: row.id,
         windowId: row.window_id,
         fingerprint: row.fingerprint,
@@ -574,6 +582,16 @@ function createRepository(db) {
         deliveredAt: row.delivered_at,
         error: row.error,
       }));
+    },
+
+    markLocalEvent(id, { status, deliveredAt, error = null }) {
+      const info = markLocalEvent.run({
+        id,
+        status,
+        deliveredAt,
+        error,
+      });
+      return info.changes > 0;
     },
 
     startScanRun({ startedAt, source = 'manual' }) {

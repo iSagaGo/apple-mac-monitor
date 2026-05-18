@@ -5,7 +5,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 const { createRepository, openDatabase } = require('../src/db');
-const { createHttpServer, dashboardSummary } = require('../src/server');
+const { createHttpServer, dashboardSummary, safeStaticPath } = require('../src/server');
 
 function tempRepo() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apple-monitor-http-'));
@@ -157,6 +157,7 @@ test('HTTP API persists scan sources and manual scan uses saved sources', async 
   const scan = await fetch(`${baseUrl}/api/scan/run`, { method: 'POST', headers });
 
   assert.equal(update.status, 200);
+  assert.deepEqual((await update.json()).sources, { ...payload, listingEnabled: false });
   assert.equal(scan.status, 200);
   assert.deepEqual((await sources.json()).sources, { ...payload, listingEnabled: false });
   assert.equal(capturedConfig.apple.listingEnabled, false);
@@ -177,6 +178,15 @@ test('HTTP local events API returns pending local events for the Windows script'
     payload: { title: 'Mac Studio', canonicalUrl: 'https://www.apple.com.cn/shop/product/g1cepch/a' },
     createdAt: '2026-05-18T21:20:08.882+08:00',
   });
+  repo.recordLocalEvent({
+    windowId: null,
+    fingerprint: 'ofp_delivered_test',
+    eventType: 'availability_alert',
+    status: 'delivered',
+    payload: { title: 'Old Mac Studio' },
+    createdAt: '2026-05-18T21:19:08.882+08:00',
+    deliveredAt: '2026-05-18T21:19:30.000+08:00',
+  });
   const server = createHttpServer({ config: testConfig(), repo });
   const baseUrl = await listen(server);
 
@@ -194,6 +204,75 @@ test('HTTP local events API returns pending local events for the Windows script'
 
   server.close();
   db.close();
+});
+
+test('HTTP local events API marks events after Windows script delivery', async () => {
+  const { db, repo } = tempRepo();
+  repo.recordLocalEvent({
+    windowId: null,
+    fingerprint: 'ofp_ack_test',
+    eventType: 'availability_alert',
+    status: 'pending',
+    payload: { title: 'Mac Studio' },
+    createdAt: '2026-05-18T21:20:08.882+08:00',
+  });
+  const server = createHttpServer({ config: testConfig(), repo });
+  const baseUrl = await listen(server);
+  const headers = {
+    authorization: `Bearer ${'b'.repeat(32)}`,
+    'content-type': 'application/json',
+  };
+
+  const events = await fetch(`${baseUrl}/api/local/events`, { headers });
+  const eventId = (await events.json()).events[0].id;
+  const ack = await fetch(`${baseUrl}/api/local/events/${eventId}/ack`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ status: 'delivered' }),
+  });
+  const afterAck = await fetch(`${baseUrl}/api/local/events`, { headers });
+  const row = db.prepare('select status, delivered_at from local_events where id = ?').get(eventId);
+
+  assert.equal(ack.status, 200);
+  assert.equal((await afterAck.json()).events.length, 0);
+  assert.equal(row.status, 'delivered');
+  assert.match(row.delivered_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+
+  server.close();
+  db.close();
+});
+
+test('HTTP API rejects malformed and oversized JSON bodies as client errors', async () => {
+  const { db, repo } = tempRepo();
+  const server = createHttpServer({ config: testConfig(), repo });
+  const baseUrl = await listen(server);
+  const headers = {
+    authorization: `Bearer ${'a'.repeat(32)}`,
+    'content-type': 'application/json',
+  };
+
+  const malformed = await fetch(`${baseUrl}/api/rules`, {
+    method: 'PUT',
+    headers,
+    body: '{"rules":',
+  });
+  const oversized = await fetch(`${baseUrl}/api/rules`, {
+    method: 'PUT',
+    headers,
+    body: JSON.stringify({ rules: [], padding: 'x'.repeat(70_000) }),
+  });
+
+  assert.equal(malformed.status, 400);
+  assert.equal((await malformed.json()).error, 'invalid_json');
+  assert.equal(oversized.status, 413);
+  assert.equal((await oversized.json()).error, 'request_body_too_large');
+
+  server.close();
+  db.close();
+});
+
+test('safeStaticPath rejects paths that resolve outside the public directory', () => {
+  assert.equal(safeStaticPath('/../public-secret/leak.txt'), null);
 });
 
 test('dashboard summary prioritizes manual detail offers and alert-rule matches', () => {

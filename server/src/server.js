@@ -13,6 +13,7 @@ const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 const SESSION_COOKIE = 'apple_monitor_session';
 const SCAN_RATE_LIMIT_MS = 30_000;
 const TEST_NOTIFY_RATE_LIMIT_MS = 30_000;
+const MAX_JSON_BODY_BYTES = 64 * 1024;
 
 function sha256(value) {
   return crypto.createHash('sha256').update(String(value)).digest('hex');
@@ -96,14 +97,23 @@ function httpError(statusCode, message) {
 
 async function readJsonBody(req) {
   const chunks = [];
+  let byteLength = 0;
   for await (const chunk of req) {
+    byteLength += chunk.length;
+    if (byteLength > MAX_JSON_BODY_BYTES) {
+      throw httpError(413, 'request_body_too_large');
+    }
     chunks.push(chunk);
   }
   const body = Buffer.concat(chunks).toString('utf8');
   if (!body) {
     return {};
   }
-  return JSON.parse(body);
+  try {
+    return JSON.parse(body);
+  } catch {
+    throw httpError(400, 'invalid_json');
+  }
 }
 
 function optionalFiniteNumber(value, fieldName, ruleIndex) {
@@ -289,10 +299,19 @@ function safeStaticPath(urlPath) {
   const relativePath = urlPath === '/' ? 'index.html' : urlPath.replace(/^\/+/, '');
   const filePath = path.resolve(PUBLIC_DIR, relativePath);
   const root = path.resolve(PUBLIC_DIR);
-  if (!filePath.startsWith(root)) {
+  const relativeToRoot = path.relative(root, filePath);
+  if (relativeToRoot.startsWith('..') || path.isAbsolute(relativeToRoot)) {
     return null;
   }
   return filePath;
+}
+
+function localEventAckStatus(body) {
+  const status = String(body.status || 'delivered');
+  if (!['delivered', 'failed'].includes(status)) {
+    throw httpError(400, 'invalid_local_event_status');
+  }
+  return status;
 }
 
 function serveStatic(req, res, url, config) {
@@ -403,7 +422,7 @@ function createHttpServer({
         const body = await readJsonBody(req);
         const sources = validateSourceUrls(body);
         repo.setSetting('scan_sources', sources, nowUtc8Iso());
-        sendJson(res, 200, { ok: true, sources });
+        sendJson(res, 200, { ok: true, sources: effectiveSources(repo, config) });
         return;
       }
 
@@ -497,7 +516,25 @@ function createHttpServer({
       }
 
       if (req.method === 'GET' && url.pathname === '/api/local/events') {
-        sendJson(res, 200, { ok: true, events: repo.listLocalEvents?.({ limit: 100 }) ?? [] });
+        sendJson(res, 200, { ok: true, events: repo.listLocalEvents?.({ limit: 100, status: 'pending' }) ?? [] });
+        return;
+      }
+
+      const localEventAckMatch = url.pathname.match(/^\/api\/local\/events\/(\d+)\/ack$/);
+      if (req.method === 'POST' && localEventAckMatch) {
+        const body = await readJsonBody(req);
+        const status = localEventAckStatus(body);
+        const deliveredAt = nowUtc8Iso();
+        const updated = repo.markLocalEvent?.(Number(localEventAckMatch[1]), {
+          status,
+          deliveredAt,
+          error: status === 'failed' ? String(body.error || 'local_delivery_failed') : null,
+        });
+        if (!updated) {
+          sendError(res, 404, 'local_event_not_found');
+          return;
+        }
+        sendJson(res, 200, { ok: true, status, deliveredAt });
         return;
       }
 
@@ -519,5 +556,6 @@ module.exports = {
   effectiveConfig,
   effectiveRules,
   effectiveSources,
+  safeStaticPath,
   sortDashboardOffers,
 };
