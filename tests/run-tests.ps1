@@ -123,6 +123,9 @@ Assert-Equal ($sameUrlFirstKey -ne $sameUrlSecondKey) $true 'distinguishes diffe
 $runMonitorSource = Get-Content -LiteralPath (Join-Path $repoRoot 'run-monitor.ps1') -Raw -Encoding UTF8
 Assert-Match $runMonitorSource 'ShowDialog\(' 'uses a manual-close desktop alert dialog'
 Assert-Equal ([bool] ($runMonitorSource -match 'ShowBalloonTip\(10000\)|Popup\(\$Message,\s*10')) $false 'does not use auto-closing desktop alert timers'
+Assert-Match $runMonitorSource "-STA" 'launches desktop alert dialog in an STA PowerShell process'
+Assert-Match $runMonitorSource "WindowStyle Normal" 'launches desktop alert dialog from a visible PowerShell process'
+Assert-Match $runMonitorSource "Desktop notification closed" 'logs when the manual-close desktop alert dialog is closed'
 Assert-Match $runMonitorSource '/api/local/events' 'polls server local events for strong local alerts'
 Assert-Match $runMonitorSource '/ack' 'acknowledges server local events after delivery'
 Assert-Match $runMonitorSource 'LOCAL_SCRIPT_TOKEN' 'supports local script token for server event polling'

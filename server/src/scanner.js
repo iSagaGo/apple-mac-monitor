@@ -458,6 +458,39 @@ function selectMatchingRule(offer, rules) {
   return rules.find((rule) => matchesAlertRule(offer, rule)) ?? null;
 }
 
+function unmatchedOfferState(transition) {
+  return {
+    ...transition.nextState,
+    windowOpen: false,
+    lastAlertAt: null,
+  };
+}
+
+function promoteExistingAvailableWithoutWindow({ repo, offer, fingerprint, previous, transition, now }) {
+  if (
+    transition.shouldAlert ||
+    offer.availabilityStatus !== 'available' ||
+    previous?.windowOpen !== true ||
+    repo.findOpenAvailabilityWindow({
+      canonicalUrl: offer.canonicalUrl,
+      fingerprint,
+    })
+  ) {
+    return transition;
+  }
+
+  return {
+    ...transition,
+    shouldAlert: true,
+    reason: 'existing_available_without_alert_window',
+    nextState: {
+      ...transition.nextState,
+      windowOpen: true,
+      lastAlertAt: now,
+    },
+  };
+}
+
 async function processOffer({
   repo,
   config,
@@ -466,6 +499,7 @@ async function processOffer({
   fetchImpl = fetch,
   telegramDeliveryEnabled = true,
   retryOnNotificationFailure = true,
+  bypassAlertRules = false,
 }) {
   const fingerprint = buildOfferFingerprint(offer);
   repo.upsertOfferSnapshot(offer, { fingerprint, seenAt: now });
@@ -473,22 +507,29 @@ async function processOffer({
   const previous = repo.getOfferState(offer.canonicalUrl);
   const rules = config.alerts?.rules ?? [];
   const matchingRule = selectMatchingRule(offer, rules);
+  const effectiveRule = matchingRule || (bypassAlertRules ? { id: 'manual-monitor-priority' } : null);
   const transition = decideAvailabilityWindow({
     previous,
     offer,
     now,
-    repeatAlertAfterSeconds: matchingRule ? ruleRepeatThreshold(matchingRule) : null,
+    repeatAlertAfterSeconds: effectiveRule ? ruleRepeatThreshold(effectiveRule) : null,
   });
+  const effectiveTransition = effectiveRule
+    ? promoteExistingAvailableWithoutWindow({ repo, offer, fingerprint, previous, transition, now })
+    : transition;
 
-  if (!matchingRule || !transition.shouldAlert) {
-    repo.saveOfferState(offer.canonicalUrl, transition.nextState);
+  if (!effectiveRule || !effectiveTransition.shouldAlert) {
+    repo.saveOfferState(
+      offer.canonicalUrl,
+      effectiveRule ? effectiveTransition.nextState : unmatchedOfferState(effectiveTransition),
+    );
     closeOpenWindowIfNeeded({ repo, previous, offer, fingerprint, now });
     return {
       fingerprint,
-      matched: Boolean(matchingRule),
+      matched: Boolean(effectiveRule),
       alerted: false,
       eventsRecorded: 0,
-      reason: transition.reason,
+      reason: effectiveTransition.reason,
     };
   }
 
@@ -502,7 +543,7 @@ async function processOffer({
       canonicalUrl: offer.canonicalUrl,
       productId: offer.productId,
       openedAt: now,
-      openReason: transition.reason,
+      openReason: effectiveTransition.reason,
     });
   }
 
@@ -510,10 +551,10 @@ async function processOffer({
     repo,
     config,
     offer,
-    rule: matchingRule,
+    rule: effectiveRule,
     fingerprint,
     windowRecord,
-    transition,
+    transition: effectiveTransition,
     now,
     fetchImpl,
     telegramDeliveryEnabled,
@@ -527,7 +568,7 @@ async function processOffer({
       closeReason: 'notification_failed',
     });
   } else {
-    repo.saveOfferState(offer.canonicalUrl, transition.nextState);
+    repo.saveOfferState(offer.canonicalUrl, effectiveTransition.nextState);
   }
 
   return {
@@ -535,7 +576,7 @@ async function processOffer({
     matched: true,
     alerted: true,
     eventsRecorded: delivery.eventsRecorded,
-    reason: transition.reason,
+    reason: effectiveTransition.reason,
     windowId: windowRecord.id,
     canonicalUrl: offer.canonicalUrl,
   };
@@ -688,6 +729,7 @@ async function scanOnce({ config, repo, fetchImpl = fetch, now = nowUtc8Iso(), s
         fetchImpl,
         telegramDeliveryEnabled: false,
         retryOnNotificationFailure: !(item.isManual && manualTelegramSummaryCanConfirm),
+        bypassAlertRules: item.isManual,
       });
       if (result.matched) {
         summary.matchedOffers += 1;

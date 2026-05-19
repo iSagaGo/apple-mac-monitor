@@ -218,6 +218,10 @@ function sortDashboardOffers(offers, rules) {
   });
 }
 
+function hasDisplayValue(value) {
+  return value !== undefined && value !== null && value !== '';
+}
+
 function canonicalDashboardUrl(value) {
   if (!value) return null;
   try {
@@ -225,6 +229,75 @@ function canonicalDashboardUrl(value) {
   } catch {
     return String(value).trim();
   }
+}
+
+function dashboardOfferKey(offer) {
+  return (
+    canonicalDashboardUrl(offer.canonicalUrl) ||
+    canonicalDashboardUrl(offer.url) ||
+    (offer.productId ? String(offer.productId).trim().toUpperCase() : null)
+  );
+}
+
+function mergeDashboardOffer(primary, secondary) {
+  const merged = { ...primary };
+  const mergeFields = [
+    'basePartNumber',
+    'title',
+    'model',
+    'chip',
+    'cpuCores',
+    'gpuCores',
+    'memory',
+    'memoryText',
+    'storage',
+    'storageText',
+    'availabilityStatus',
+  ];
+
+  for (const field of mergeFields) {
+    if (!hasDisplayValue(merged[field]) && hasDisplayValue(secondary[field])) {
+      merged[field] = secondary[field];
+    }
+  }
+
+  if (!merged.price && secondary.price) {
+    merged.price = secondary.price;
+  } else if (merged.price && secondary.price) {
+    merged.price = { ...secondary.price, ...merged.price };
+    if (!hasDisplayValue(merged.price.amount) && hasDisplayValue(secondary.price.amount)) {
+      merged.price.amount = secondary.price.amount;
+    }
+    if (!hasDisplayValue(merged.price.rawAmount) && hasDisplayValue(secondary.price.rawAmount)) {
+      merged.price.rawAmount = secondary.price.rawAmount;
+    }
+  }
+
+  return merged;
+}
+
+function dedupeDashboardOffers(offers) {
+  const deduped = [];
+  const byKey = new Map();
+
+  for (const offer of offers) {
+    const key = dashboardOfferKey(offer);
+    if (!key) {
+      deduped.push(offer);
+      continue;
+    }
+
+    const index = byKey.get(key);
+    if (index === undefined) {
+      byKey.set(key, deduped.length);
+      deduped.push(offer);
+      continue;
+    }
+
+    deduped[index] = mergeDashboardOffer(deduped[index], offer);
+  }
+
+  return deduped;
 }
 
 function coreDashboardOffers(offers, sources) {
@@ -241,7 +314,7 @@ function coreDashboardOffers(offers, sources) {
 function dashboardSummary(repo, config) {
   const rules = effectiveRules(repo, config);
   const sources = effectiveSources(repo, config);
-  const offers = sortDashboardOffers(repo.listOfferSnapshots({ limit: 200 }), rules);
+  const offers = dedupeDashboardOffers(sortDashboardOffers(repo.listOfferSnapshots({ limit: 200 }), rules));
   return {
     ok: true,
     now: nowUtc8Iso(),

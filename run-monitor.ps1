@@ -98,50 +98,83 @@ function Send-DesktopNotification {
         [Parameter(Mandatory = $true)] [string] $Message
     )
 
+    $alertId = [Guid]::NewGuid().ToString('N')
+    $payloadPath = Join-Path ([System.IO.Path]::GetTempPath()) "apple-monitor-alert-$alertId.json"
+    $scriptPath = Join-Path ([System.IO.Path]::GetTempPath()) "apple-monitor-alert-$alertId.ps1"
+
     try {
-        Add-Type -AssemblyName System.Windows.Forms
-        Add-Type -AssemblyName System.Drawing
+        [ordered]@{
+            title   = $Title
+            message = $Message
+        } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $payloadPath -Encoding UTF8
 
-        $form = New-Object System.Windows.Forms.Form
-        $form.Text = $Title
-        $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
-        $form.Size = New-Object System.Drawing.Size(720, 260)
-        $form.TopMost = $true
-        $form.MaximizeBox = $false
-        $form.MinimizeBox = $false
-        $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+        @'
+param(
+    [Parameter(Mandatory = $true)] [string] $PayloadPath
+)
 
-        $label = New-Object System.Windows.Forms.Label
-        $label.AutoSize = $false
-        $label.Location = New-Object System.Drawing.Point(24, 24)
-        $label.Size = New-Object System.Drawing.Size(656, 130)
-        $label.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 11)
-        $label.Text = $Message
+$ErrorActionPreference = 'Stop'
 
-        $button = New-Object System.Windows.Forms.Button
-        $button.Text = 'OK'
-        $button.Size = New-Object System.Drawing.Size(120, 36)
-        $button.Location = New-Object System.Drawing.Point(560, 170)
-        $button.DialogResult = [System.Windows.Forms.DialogResult]::OK
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
 
-        $form.Controls.Add($label)
-        $form.Controls.Add($button)
-        $form.AcceptButton = $button
-        [void] $form.ShowDialog()
-        $form.Dispose()
+$payload = Get-Content -LiteralPath $PayloadPath -Raw -Encoding UTF8 | ConvertFrom-Json
+
+$form = New-Object System.Windows.Forms.Form
+$form.Text = [string] $payload.title
+$form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+$form.Size = New-Object System.Drawing.Size(760, 300)
+$form.TopMost = $true
+$form.MaximizeBox = $false
+$form.MinimizeBox = $false
+$form.ShowInTaskbar = $true
+$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+
+$label = New-Object System.Windows.Forms.Label
+$label.AutoSize = $false
+$label.Location = New-Object System.Drawing.Point(24, 24)
+$label.Size = New-Object System.Drawing.Size(696, 170)
+$label.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 11)
+$label.Text = [string] $payload.message
+
+$button = New-Object System.Windows.Forms.Button
+$button.Text = 'OK'
+$button.Size = New-Object System.Drawing.Size(120, 36)
+$button.Location = New-Object System.Drawing.Point(600, 214)
+$button.DialogResult = [System.Windows.Forms.DialogResult]::OK
+
+$form.Controls.Add($label)
+$form.Controls.Add($button)
+$form.AcceptButton = $button
+$form.Add_Shown({
+    $form.Activate()
+    $form.BringToFront()
+})
+
+[void] $form.ShowDialog()
+$form.Dispose()
+'@ | Set-Content -LiteralPath $scriptPath -Encoding UTF8
+
+        Write-MonitorLog -Message 'Showing desktop notification dialog.'
+        $process = Start-Process `
+            -FilePath 'powershell.exe' `
+            -ArgumentList @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', "`"$scriptPath`"", "`"$payloadPath`"") `
+            -WindowStyle Normal `
+            -PassThru `
+            -Wait
+
+        if ($process.ExitCode -ne 0) {
+            throw "Desktop notification process exited with code $($process.ExitCode)."
+        }
+
+        Write-MonitorLog -Message 'Desktop notification closed.'
     }
     catch {
-        try {
-            [System.Windows.Forms.MessageBox]::Show(
-                $Message,
-                $Title,
-                [System.Windows.Forms.MessageBoxButtons]::OK,
-                [System.Windows.Forms.MessageBoxIcon]::Warning
-            ) | Out-Null
-        }
-        catch {
-            Write-MonitorLog -Level 'WARN' -Message "Desktop notification failed: $($_.Exception.Message)"
-        }
+        Write-MonitorLog -Level 'WARN' -Message "Desktop notification failed: $($_.Exception.Message)"
+    }
+    finally {
+        Remove-Item -LiteralPath $payloadPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $scriptPath -Force -ErrorAction SilentlyContinue
     }
 }
 

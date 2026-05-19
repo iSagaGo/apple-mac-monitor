@@ -16,8 +16,28 @@
   },
   "products": [
     {
-      "name": "Apple refurbished Mac target",
+      "name": "Apple refurbished Mac G1CEPCH/A",
       "url": "https://www.apple.com.cn/shop/product/g1cepch/a",
+      "enabled": true
+    },
+    {
+      "name": "Apple refurbished Mac G1CE8CH/A",
+      "url": "https://www.apple.com.cn/shop/product/g1ce8ch/a",
+      "enabled": true
+    },
+    {
+      "name": "Apple refurbished Mac G1CEDCH/A",
+      "url": "https://www.apple.com.cn/shop/product/g1cedch/a",
+      "enabled": true
+    },
+    {
+      "name": "Apple refurbished Mac G1CE3CH/A",
+      "url": "https://www.apple.com.cn/shop/product/g1ce3ch/a",
+      "enabled": true
+    },
+    {
+      "name": "Apple refurbished Mac G1CEJCH/A",
+      "url": "https://www.apple.com.cn/shop/product/g1cejch/a",
       "enabled": true
     }
   ]

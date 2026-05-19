@@ -423,6 +423,75 @@ test('dashboard summary exposes core offers from independent monitor URLs', () =
   );
 });
 
+test('dashboard summary deduplicates snapshots for the same product URL and keeps richer config fields', () => {
+  const manualUrl = 'https://www.apple.com.cn/shop/product/fc6k4ch/a';
+  const offers = [
+    {
+      productId: 'FC6K4CH/A',
+      canonicalUrl: manualUrl,
+      source: 'detail',
+      title: 'Refurbished 15-inch MacBook Air M4',
+      model: 'MacBook Air',
+      chip: 'M4',
+      memory: null,
+      memoryText: null,
+      storage: null,
+      storageText: null,
+      price: { amount: 'RMB 9,099', rawAmount: 9099 },
+      availabilityStatus: 'available',
+      lastSeenAt: '2026-05-19T12:35:38+08:00',
+    },
+    {
+      productId: 'FC6K4CH/A',
+      canonicalUrl: manualUrl,
+      source: 'listing',
+      title: 'Refurbished 15-inch MacBook Air M4',
+      model: 'MacBook Air',
+      chip: 'M4',
+      memory: '24gb',
+      memoryText: '24GB',
+      storage: '512gb',
+      storageText: '512GB',
+      price: { amount: 'RMB 9,099', rawAmount: 9099 },
+      availabilityStatus: 'available',
+      lastSeenAt: '2026-05-19T01:00:39+08:00',
+    },
+  ];
+  const repo = {
+    getSetting(name) {
+      if (name === 'scan_sources') {
+        return {
+          listingUrls: ['https://www.apple.com.cn/shop/refurbished/mac/mac-studio'],
+          manualUrls: [manualUrl],
+        };
+      }
+      return null;
+    },
+    listOfferSnapshots() {
+      return offers;
+    },
+    listAvailabilityWindows() {
+      return [];
+    },
+    listScanRuns() {
+      return [];
+    },
+    getEventCounts() {
+      return { sms: 0, telegram: 0, local: 0 };
+    },
+  };
+
+  const summary = dashboardSummary(repo, testConfig());
+
+  assert.equal(summary.offers.length, 1);
+  assert.equal(summary.coreOffers.length, 1);
+  assert.equal(summary.offers[0].productId, 'FC6K4CH/A');
+  assert.equal(summary.offers[0].source, 'detail');
+  assert.equal(summary.offers[0].memoryText, '24GB');
+  assert.equal(summary.offers[0].storageText, '512GB');
+  assert.equal(summary.offers[0].lastSeenAt, '2026-05-19T12:35:38+08:00');
+});
+
 test('HTTP API notification test endpoints use real senders when configured', async () => {
   const { db, repo } = tempRepo();
   const requests = [];

@@ -163,6 +163,60 @@ test('scanOnce stores unavailable manual detail without creating alerts', async 
   db.close();
 });
 
+test('scanOnce treats available manual monitor products as highest priority over alert filters', async () => {
+  const manualUrl = 'https://www.apple.com.cn/shop/product/g1ce3ch/a';
+  const { db, repo } = tempDb();
+  const telegramRequests = [];
+  const config = scannerConfig({
+    apple: { manualUrls: [manualUrl] },
+    alerts: {
+      rules: [
+        {
+          id: 'intentionally-non-matching-rule',
+          model: 'MacBook Pro',
+          memory: ['16gb'],
+        },
+      ],
+    },
+    telegram: {
+      botToken: 'dummy-token',
+      chatId: '987654321',
+      apiBaseUrl: 'https://telegram.example.test',
+    },
+  });
+  const responses = {
+    [manualUrl]: macStudioDetailHtml({
+      productId: 'G1CE3CH/A',
+      pathProductId: 'g1ce3ch',
+      available: true,
+    }),
+  };
+
+  const summary = await scanOnce({
+    config,
+    repo,
+    fetchImpl: async (url, options = {}) => {
+      if (options.method === 'POST' && String(url).includes('telegram.example.test')) {
+        telegramRequests.push(JSON.parse(options.body));
+        return { ok: true, json: async () => ({ ok: true, result: { message_id: telegramRequests.length } }) };
+      }
+      const html = responses[url];
+      return html === undefined
+        ? { ok: false, status: 404, text: async () => 'not found' }
+        : { ok: true, status: 200, text: async () => html };
+    },
+    now: '2026-05-19T12:10:00+08:00',
+  });
+
+  assert.equal(summary.scannedOffers, 1);
+  assert.equal(summary.matchedOffers, 1);
+  assert.equal(summary.alertsCreated, 1);
+  assert.equal(telegramRequests.length, 2);
+  assert.match(telegramRequests[0].text, /https:\/\/www\.apple\.com\.cn\/shop\/product\/g1ce3ch\/a/);
+  assert.equal(db.prepare('select count(*) as count from availability_windows').get().count, 1);
+  db.close();
+});
+
 test('processOffer alerts again when availability returns after an unknown scan', async () => {
   const { db, repo } = tempDb();
   const config = scannerConfig({
@@ -207,6 +261,68 @@ test('processOffer alerts again when availability returns after an unknown scan'
   assert.equal(returned.alerted, true);
   assert.equal(returned.reason, 'restocked');
   assert.equal(repo.listAvailabilityWindows({ limit: 10 }).filter((window) => window.status === 'open').length, 1);
+  db.close();
+});
+
+test('processOffer alerts manual priority offers that were previously seen without a reminder window', async () => {
+  const { db, repo } = tempDb();
+  const config = scannerConfig({
+    alerts: {
+      rules: [
+        {
+          id: 'intentionally-non-matching-rule',
+          model: 'MacBook Pro',
+          memory: ['16gb'],
+        },
+      ],
+    },
+    delivery: {
+      localEventsEnabled: false,
+      telegramEnabled: false,
+    },
+  });
+  const offer = {
+    source: 'detail',
+    productId: 'ZZTESTCH/A',
+    canonicalUrl: 'https://www.apple.com.cn/shop/product/zztestch/a',
+    url: 'https://www.apple.com.cn/shop/product/zztestch/a',
+    title: 'Refurbished iMac',
+    model: 'iMac',
+    chip: 'M4',
+    memory: '16gb',
+    memoryText: '16GB',
+    storage: '256gb',
+    storageText: '256GB',
+    price: { amount: 'RMB 9,299', rawAmount: 9299 },
+    availabilityStatus: 'available',
+  };
+
+  const first = await processOffer({
+    repo,
+    config,
+    offer,
+    now: '2026-05-19T12:00:00+08:00',
+  });
+  const stateAfterFirstScan = repo.getOfferState(offer.canonicalUrl);
+  repo.saveOfferState(offer.canonicalUrl, {
+    ...stateAfterFirstScan,
+    windowOpen: true,
+    lastAlertAt: '2026-05-19T12:00:00+08:00',
+  });
+  const second = await processOffer({
+    repo,
+    config,
+    offer,
+    now: '2026-05-19T12:00:10+08:00',
+    bypassAlertRules: true,
+  });
+
+  assert.equal(first.matched, false);
+  assert.equal(first.alerted, false);
+  assert.equal(stateAfterFirstScan.windowOpen, false);
+  assert.equal(second.matched, true);
+  assert.equal(second.alerted, true);
+  assert.equal(repo.listAvailabilityWindows({ limit: 10 }).length, 1);
   db.close();
 });
 
