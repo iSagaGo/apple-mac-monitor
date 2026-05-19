@@ -6,6 +6,7 @@ const vm = require('node:vm');
 
 const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
 const appJs = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+const stylesCss = fs.readFileSync(path.join(__dirname, '..', 'public', 'styles.css'), 'utf8');
 
 function loadDashboardScript(overrides = {}) {
   const elements = new Map();
@@ -55,7 +56,8 @@ function loadDashboardScript(overrides = {}) {
       timeouts[id - 1] = null;
     },
     URL,
-    window: { addEventListener() {} },
+    URLSearchParams,
+    window: { addEventListener() {}, location: { search: overrides.search || '' } },
     __elements: elements,
     __intervals: intervals,
     __timeouts: timeouts,
@@ -91,6 +93,58 @@ test('dashboard moves alert rule editing into a modal opened from the top action
   assert.match(html, /id="ruleForm"/);
   assert.match(html, /id="ruleCloseButton"/);
   assert.equal(html.includes('id="ruleForm" class="panel"'), false);
+});
+
+test('dashboard only shows top action buttons for management sessions', () => {
+  const sandbox = loadDashboardScript({
+    fetch: async (path) => ({
+      ok: true,
+      json: async () =>
+        path === '/api/session'
+          ? { ok: true, canManage: false }
+          : {
+              eventCounts: { sms: 0, telegram: 0 },
+              offers: [],
+              rules: [],
+              scans: [],
+              sources: { listingUrls: [], manualUrls: [] },
+              now: '2026-05-18T21:20:08.882+08:00',
+              windows: [],
+            },
+    }),
+  });
+
+  assert.match(html, /id="adminActions"[^>]*hidden/);
+  sandbox.applySession({ canManage: false });
+  assert.equal(sandbox.__elements.get('#adminActions').hidden, true);
+
+  sandbox.applySession({ canManage: true });
+
+  assert.equal(sandbox.__elements.get('#adminActions').hidden, false);
+});
+
+test('dashboard sends the current URL token as the management authorization header', async () => {
+  const token = 'a'.repeat(32);
+  const requests = [];
+  const sandbox = loadDashboardScript({
+    search: `?token=${token}`,
+    fetch: async (path, options) => {
+      requests.push({ path, options });
+      return {
+        ok: true,
+        json: async () => ({ ok: true, canManage: true }),
+      };
+    },
+  });
+
+  await sandbox.api('/api/session');
+
+  assert.equal(requests.at(-1).options.headers.authorization, `Bearer ${token}`);
+  assert.equal(requests.at(-1).options.credentials, 'omit');
+});
+
+test('dashboard CSS keeps the hidden management action bar invisible', () => {
+  assert.match(stylesCss, /\.actions\[hidden\]\s*\{[^}]*display:\s*none\s*;/s);
 });
 
 test('dashboard uses numeric inputs for alert price and repeat threshold fields', () => {

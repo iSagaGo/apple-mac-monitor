@@ -10,37 +10,15 @@ const { scanOnce } = require('./scanner');
 const { nowUtc8Iso, toUtc8Iso } = require('./time');
 
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
-const SESSION_COOKIE = 'apple_monitor_session';
 const SCAN_RATE_LIMIT_MS = 30_000;
 const TEST_NOTIFY_RATE_LIMIT_MS = 30_000;
 const LOCAL_EVENT_LEASE_MS = 60_000;
 const MAX_JSON_BODY_BYTES = 64 * 1024;
 
-function sha256(value) {
-  return crypto.createHash('sha256').update(String(value)).digest('hex');
-}
-
 function safeTimingEqual(a, b) {
   const left = Buffer.from(String(a));
   const right = Buffer.from(String(b));
   return left.length === right.length && crypto.timingSafeEqual(left, right);
-}
-
-function parseCookies(cookieHeader = '') {
-  return Object.fromEntries(
-    cookieHeader
-      .split(';')
-      .map((part) => part.trim())
-      .filter(Boolean)
-      .map((part) => {
-        const [key, ...valueParts] = part.split('=');
-        return [key, decodeURIComponent(valueParts.join('='))];
-      }),
-  );
-}
-
-function sessionValue(config) {
-  return sha256(`session:${config.auth.adminToken}`);
 }
 
 function isBearerAuthorized(req, config) {
@@ -49,16 +27,15 @@ function isBearerAuthorized(req, config) {
   return safeTimingEqual(authorization, expected);
 }
 
-function isSessionAuthorized(req, config) {
-  const cookies = parseCookies(req.headers.cookie);
-  return cookies[SESSION_COOKIE] && safeTimingEqual(cookies[SESSION_COOKIE], sessionValue(config));
-}
-
 function isAuthorized(req, config) {
   if (config.auth.localDevAuthDisabled) {
     return true;
   }
-  return isBearerAuthorized(req, config) || isSessionAuthorized(req, config);
+  return isBearerAuthorized(req, config);
+}
+
+function isPublicApiRequest(req, url) {
+  return req.method === 'GET' && ['/api/session', '/api/summary'].includes(url.pathname);
 }
 
 function isLocalAuthorized(req, config) {
@@ -389,16 +366,6 @@ function localEventAckStatus(body) {
 }
 
 function serveStatic(req, res, url, config) {
-  if (!isAuthorized(req, config)) {
-    send(
-      res,
-      401,
-      '<!doctype html><meta charset="utf-8"><title>Unauthorized</title><body>需要认证。请使用 /?token=ADMIN_TOKEN 登录。</body>',
-      { 'content-type': 'text/html; charset=utf-8' },
-    );
-    return;
-  }
-
   const filePath = safeStaticPath(url.pathname);
   if (!filePath || !fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
     sendError(res, 404, 'not_found');
@@ -453,17 +420,8 @@ function createHttpServer({
         return;
       }
 
-      if (url.pathname === '/' && url.searchParams.get('token')) {
-        if (!safeTimingEqual(url.searchParams.get('token'), config.auth.adminToken)) {
-          sendError(res, 401, 'invalid_token');
-          return;
-        }
-        send(res, 302, '', {
-          location: '/',
-          'set-cookie': `${SESSION_COOKIE}=${encodeURIComponent(
-            sessionValue(config),
-          )}; HttpOnly; SameSite=Lax; Path=/`,
-        });
+      if (req.method === 'GET' && url.pathname === '/api/session') {
+        sendJson(res, 200, { ok: true, canManage: isAuthorized(req, config) });
         return;
       }
 
@@ -472,7 +430,7 @@ function createHttpServer({
           sendError(res, 401, 'unauthorized');
           return;
         }
-      } else if (url.pathname.startsWith('/api/') && !isAuthorized(req, config)) {
+      } else if (url.pathname.startsWith('/api/') && !isPublicApiRequest(req, url) && !isAuthorized(req, config)) {
         sendError(res, 401, 'unauthorized');
         return;
       }

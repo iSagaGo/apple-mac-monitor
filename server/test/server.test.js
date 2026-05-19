@@ -1,4 +1,5 @@
 ﻿const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -43,25 +44,78 @@ function testConfig() {
   };
 }
 
-test('HTTP API exposes unauthenticated health and protects dashboard data', async () => {
+test('HTTP API exposes public dashboard reads and protects management writes', async () => {
   const { db, repo } = tempRepo();
   const server = createHttpServer({ config: testConfig(), repo });
   const baseUrl = await listen(server);
 
-  const health = await fetch(`${baseUrl}/api/health`);
-  const unauthorized = await fetch(`${baseUrl}/api/summary`);
-  const authorized = await fetch(`${baseUrl}/api/summary`, {
-    headers: { authorization: `Bearer ${'a'.repeat(32)}` },
-  });
+  try {
+    const health = await fetch(`${baseUrl}/api/health`);
+    const index = await fetch(`${baseUrl}/`);
+    const indexWithToken = await fetch(`${baseUrl}/?token=${'a'.repeat(32)}`, { redirect: 'manual' });
+    const publicSession = await fetch(`${baseUrl}/api/session`);
+    const publicSummary = await fetch(`${baseUrl}/api/summary`);
+    const unauthorizedWrite = await fetch(`${baseUrl}/api/rules`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        rules: [{ id: 'mac-studio-256gb', model: 'Mac Studio', memory: ['256gb'] }],
+      }),
+    });
+    const authorized = await fetch(`${baseUrl}/api/summary`, {
+      headers: { authorization: `Bearer ${'a'.repeat(32)}` },
+    });
+    const authorizedSession = await fetch(`${baseUrl}/api/session`, {
+      headers: { authorization: `Bearer ${'a'.repeat(32)}` },
+    });
 
-  assert.equal(health.status, 200);
-  assert.equal((await health.json()).ok, true);
-  assert.equal(unauthorized.status, 401);
-  assert.equal(authorized.status, 200);
-  assert.deepEqual((await authorized.json()).rules, testConfig().alerts.rules);
+    assert.equal(health.status, 200);
+    assert.equal((await health.json()).ok, true);
+    assert.equal(index.status, 200);
+    assert.match(await index.text(), /id="adminActions"/);
+    assert.equal(indexWithToken.status, 200);
+    assert.equal(indexWithToken.headers.has('set-cookie'), false);
+    assert.equal((await publicSession.json()).canManage, false);
+    assert.equal(publicSummary.status, 200);
+    assert.deepEqual((await publicSummary.json()).rules, testConfig().alerts.rules);
+    assert.equal(unauthorizedWrite.status, 401);
+    assert.equal(authorized.status, 200);
+    assert.deepEqual((await authorized.json()).rules, testConfig().alerts.rules);
+    assert.equal((await authorizedSession.json()).canManage, true);
+  } finally {
+    server.close();
+    db.close();
+  }
+});
 
-  server.close();
-  db.close();
+test('HTTP API ignores legacy dashboard session cookies for management authorization', async () => {
+  const { db, repo } = tempRepo();
+  const config = testConfig();
+  const server = createHttpServer({ config, repo });
+  const baseUrl = await listen(server);
+  const legacySession = crypto.createHash('sha256').update(`session:${config.auth.adminToken}`).digest('hex');
+  const headers = {
+    cookie: `apple_monitor_session=${legacySession}`,
+    'content-type': 'application/json',
+  };
+
+  try {
+    const session = await fetch(`${baseUrl}/api/session`, { headers });
+    const write = await fetch(`${baseUrl}/api/rules`, {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify({
+        rules: [{ id: 'mac-studio-256gb', model: 'Mac Studio', memory: ['256gb'] }],
+      }),
+    });
+
+    assert.equal(session.status, 200);
+    assert.equal((await session.json()).canManage, false);
+    assert.equal(write.status, 401);
+  } finally {
+    server.close();
+    db.close();
+  }
 });
 
 test('HTTP API updates alert rules and rate-limits manual scans', async () => {

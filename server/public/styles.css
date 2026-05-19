@@ -138,6 +138,10 @@ h3 {
   gap: 10px;
 }
 
+.actions[hidden] {
+  display: none;
+}
+
 .metrics {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));

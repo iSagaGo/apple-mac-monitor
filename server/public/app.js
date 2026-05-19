@@ -1,4 +1,5 @@
 const state = {
+  canManage: false,
   scanCooldownTimer: null,
   scanRunning: false,
   summary: null,
@@ -8,6 +9,7 @@ const AUTO_REFRESH_INTERVAL_MS = 10_000;
 const SCAN_COOLDOWN_SECONDS = 10;
 const REFRESH_BUTTON_TEXT = '刷新';
 const SCAN_BUTTON_TEXT = '立即扫描';
+const ADMIN_TOKEN = new URLSearchParams(window.location.search || '').get('token') || '';
 
 const $ = (selector) => document.querySelector(selector);
 
@@ -171,6 +173,15 @@ function setRecentProductsVisible(visible) {
   panel.setAttribute('aria-hidden', visible ? 'false' : 'true');
 }
 
+function applySession(session) {
+  const canManage = Boolean(session?.canManage);
+  state.canManage = canManage;
+  const actions = $('#adminActions');
+  if (!actions) return;
+  actions.hidden = !canManage;
+  actions.setAttribute('aria-hidden', canManage ? 'false' : 'true');
+}
+
 function renderWindows(windows) {
   $('#windows').innerHTML =
     windows
@@ -218,11 +229,12 @@ function renderSummary(summary) {
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
-    credentials: 'include',
+    credentials: 'omit',
     cache: 'no-store',
     ...options,
     headers: {
       'content-type': 'application/json',
+      ...(ADMIN_TOKEN ? { authorization: `Bearer ${ADMIN_TOKEN}` } : {}),
       ...(options.headers || {}),
     },
   });
@@ -236,6 +248,14 @@ async function api(path, options = {}) {
 async function loadSummary() {
   const summary = await api('/api/summary');
   renderSummary(summary);
+}
+
+async function loadSession() {
+  try {
+    applySession(await api('/api/session'));
+  } catch {
+    applySession({ canManage: false });
+  }
 }
 
 function refreshDashboard() {
@@ -400,6 +420,7 @@ $('#sourceButton').addEventListener('click', openSourceDialog);
 $('#sourceCloseButton').addEventListener('click', closeSourceDialog);
 $('#scanButton').addEventListener('click', runScan);
 
+loadSession();
 refreshDashboard();
 
 const autoRefreshTimer = setInterval(refreshDashboard, AUTO_REFRESH_INTERVAL_MS);
