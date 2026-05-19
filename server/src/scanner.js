@@ -13,6 +13,7 @@ const { nowUtc8Iso } = require('./time');
 
 const USER_AGENT =
   'Mozilla/5.0 AppleMacMonitor/0.1 (+https://www.apple.com.cn/shop/refurbished/mac/mac-studio)';
+const MANUAL_TELEGRAM_RETRY_SETTING = 'manual_telegram_retry';
 
 async function fetchHtml(url, { fetchImpl = fetch, timeoutMs = 15000 } = {}) {
   const controller = new AbortController();
@@ -74,6 +75,82 @@ function telegramOfferPayload(offer) {
   };
 }
 
+function manualOfferKey(offer) {
+  return offer?.canonicalUrl || offer?.url || offer?.productId || '';
+}
+
+function mergeManualOffers(...groups) {
+  const merged = [];
+  const seen = new Set();
+  for (const group of groups) {
+    for (const offer of group || []) {
+      const compact = telegramOfferPayload(offer);
+      const key = manualOfferKey(compact);
+      if (key && seen.has(key)) {
+        continue;
+      }
+      if (key) {
+        seen.add(key);
+      }
+      merged.push(compact);
+    }
+  }
+  return merged;
+}
+
+function compactAlertResult(result) {
+  return {
+    fingerprint: result.fingerprint ?? null,
+    windowId: result.windowId ?? null,
+    canonicalUrl: result.canonicalUrl ?? null,
+  };
+}
+
+function alertResultKey(result) {
+  return `${result.windowId ?? ''}:${result.fingerprint ?? ''}:${result.canonicalUrl ?? ''}`;
+}
+
+function mergeAlertResults(...groups) {
+  const merged = [];
+  const seen = new Set();
+  for (const group of groups) {
+    for (const result of group || []) {
+      const compact = compactAlertResult(result);
+      const key = alertResultKey(compact);
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      merged.push(compact);
+    }
+  }
+  return merged;
+}
+
+function pendingManualTelegramRetry(repo) {
+  const retry = repo.getSetting?.(MANUAL_TELEGRAM_RETRY_SETTING);
+  return {
+    alertResults: Array.isArray(retry?.alertResults) ? retry.alertResults.map(compactAlertResult) : [],
+    manualOffers: Array.isArray(retry?.manualOffers) ? retry.manualOffers.map(telegramOfferPayload) : [],
+  };
+}
+
+function saveManualTelegramRetry(repo, alertResults, manualOffers, now) {
+  repo.setSetting?.(
+    MANUAL_TELEGRAM_RETRY_SETTING,
+    {
+      failedAt: now,
+      alertResults: alertResults.map(compactAlertResult),
+      manualOffers: manualOffers.map(telegramOfferPayload),
+    },
+    now,
+  );
+}
+
+function clearManualTelegramRetry(repo, now) {
+  repo.setSetting?.(MANUAL_TELEGRAM_RETRY_SETTING, null, now);
+}
+
 async function recordDeliveries({
   repo,
   config,
@@ -88,6 +165,7 @@ async function recordDeliveries({
 }) {
   const payload = alertPayload({ offer, rule, windowRecord, transition, now });
   let eventsRecorded = 0;
+  const realNotificationStatuses = [];
 
   if (config.delivery?.localEventsEnabled !== false) {
     repo.recordLocalEvent({
@@ -111,6 +189,7 @@ async function recordDeliveries({
         sms: config.sms,
         templateParams: renderSmsTemplateParams(config.sms?.templateParams ?? [], payload),
         fetchImpl,
+        timeoutMs: config.delivery?.requestTimeoutMs,
       });
       smsStatus = 'sent';
       smsSentAt = now;
@@ -118,6 +197,7 @@ async function recordDeliveries({
       smsStatus = 'failed';
       smsError = error.message;
     }
+    realNotificationStatuses.push(smsStatus);
   }
 
   repo.recordSmsEvent({
@@ -144,13 +224,15 @@ async function recordDeliveries({
     let telegramStatus = 'dry_run';
     let telegramSentAt = null;
     let telegramError = null;
-    if (config.telegram?.botToken && config.telegram?.chatId) {
+    const telegramAttempted = Boolean(config.telegram?.botToken && config.telegram?.chatId);
+    if (telegramAttempted) {
       try {
         await sendTelegramMessage({
           telegram: config.telegram,
           text: alertTelegramText(payload),
           fetchImpl,
           parseMode: 'HTML',
+          timeoutMs: config.delivery?.requestTimeoutMs,
         });
         telegramStatus = 'sent';
         telegramSentAt = now;
@@ -158,6 +240,7 @@ async function recordDeliveries({
         telegramStatus = 'failed';
         telegramError = error.message;
       }
+      realNotificationStatuses.push(telegramStatus);
     }
 
     repo.recordTelegramEvent({
@@ -175,7 +258,11 @@ async function recordDeliveries({
     eventsRecorded += 1;
   }
 
-  return eventsRecorded;
+  return {
+    eventsRecorded,
+    notificationFailed:
+      realNotificationStatuses.length > 0 && realNotificationStatuses.every((status) => status === 'failed'),
+  };
 }
 
 function telegramSeparatorEnabled(config) {
@@ -215,6 +302,7 @@ async function recordTelegramSeparator({ repo, config, now, fetchImpl, direction
         text: telegramSeparatorText({ detectedAt: now, direction }),
         fetchImpl,
         parseMode: 'HTML',
+        timeoutMs: config.delivery?.requestTimeoutMs,
       });
       telegramStatus = 'sent';
       telegramSentAt = now;
@@ -235,7 +323,9 @@ async function recordTelegramSeparator({ repo, config, now, fetchImpl, direction
     sentAt: telegramSentAt,
     error: telegramError,
   });
-  repo.setSetting?.('telegram_separator_last_at', now, now);
+  if (telegramStatus !== 'failed') {
+    repo.setSetting?.('telegram_separator_last_at', now, now);
+  }
   return 1;
 }
 
@@ -263,7 +353,7 @@ async function recordPeriodicTelegramSeparator({ repo, config, now, fetchImpl })
 
 async function recordManualTelegramSummary({ repo, config, manualOffers, alertResults, now, fetchImpl }) {
   if (config.delivery?.telegramEnabled === false || alertResults.length === 0 || manualOffers.length === 0) {
-    return 0;
+    return { eventsRecorded: 0, status: 'skipped' };
   }
 
   const payload = {
@@ -281,6 +371,7 @@ async function recordManualTelegramSummary({ repo, config, manualOffers, alertRe
         text: alertTelegramText(payload),
         fetchImpl,
         parseMode: 'HTML',
+        timeoutMs: config.delivery?.requestTimeoutMs,
       });
       telegramStatus = 'sent';
       telegramSentAt = now;
@@ -303,13 +394,15 @@ async function recordManualTelegramSummary({ repo, config, manualOffers, alertRe
     error: telegramError,
   });
 
-  const windowIds = new Set();
-  for (const result of alertResults) {
-    if (!result.windowId || windowIds.has(result.windowId)) {
-      continue;
+  if (telegramStatus !== 'failed') {
+    const windowIds = new Set();
+    for (const result of alertResults) {
+      if (!result.windowId || windowIds.has(result.windowId)) {
+        continue;
+      }
+      repo.incrementWindowAlert(result.windowId, { channel: 'telegram', alertedAt: now });
+      windowIds.add(result.windowId);
     }
-    repo.incrementWindowAlert(result.windowId, { channel: 'telegram', alertedAt: now });
-    windowIds.add(result.windowId);
   }
 
   const separatorEvents =
@@ -326,7 +419,22 @@ async function recordManualTelegramSummary({ repo, config, manualOffers, alertRe
           fingerprint: firstAlert.fingerprint ?? null,
         });
 
-  return 1 + separatorEvents;
+  return { eventsRecorded: 1 + separatorEvents, status: telegramStatus };
+}
+
+function resetAlertForRetry({ repo, canonicalUrl, windowId, now, closeReason }) {
+  const state = repo.getOfferState?.(canonicalUrl);
+  if (state) {
+    repo.saveOfferState(canonicalUrl, {
+      ...state,
+      windowOpen: false,
+      lastAlertAt: null,
+      lastSeenAt: now,
+    });
+  }
+  if (windowId) {
+    repo.closeAvailabilityWindow?.(windowId, { closedAt: now, closeReason });
+  }
 }
 
 function closeOpenWindowIfNeeded({ repo, previous, offer, fingerprint, now }) {
@@ -350,7 +458,15 @@ function selectMatchingRule(offer, rules) {
   return rules.find((rule) => matchesAlertRule(offer, rule)) ?? null;
 }
 
-async function processOffer({ repo, config, offer, now, fetchImpl = fetch, telegramDeliveryEnabled = true }) {
+async function processOffer({
+  repo,
+  config,
+  offer,
+  now,
+  fetchImpl = fetch,
+  telegramDeliveryEnabled = true,
+  retryOnNotificationFailure = true,
+}) {
   const fingerprint = buildOfferFingerprint(offer);
   repo.upsertOfferSnapshot(offer, { fingerprint, seenAt: now });
 
@@ -364,10 +480,9 @@ async function processOffer({ repo, config, offer, now, fetchImpl = fetch, teleg
     repeatAlertAfterSeconds: matchingRule ? ruleRepeatThreshold(matchingRule) : null,
   });
 
-  repo.saveOfferState(offer.canonicalUrl, transition.nextState);
-  closeOpenWindowIfNeeded({ repo, previous, offer, fingerprint, now });
-
   if (!matchingRule || !transition.shouldAlert) {
+    repo.saveOfferState(offer.canonicalUrl, transition.nextState);
+    closeOpenWindowIfNeeded({ repo, previous, offer, fingerprint, now });
     return {
       fingerprint,
       matched: Boolean(matchingRule),
@@ -377,13 +492,10 @@ async function processOffer({ repo, config, offer, now, fetchImpl = fetch, teleg
     };
   }
 
-  let windowRecord = null;
-  if (transition.reason === 'repeat_threshold_elapsed') {
-    windowRecord = repo.findOpenAvailabilityWindow({
-      canonicalUrl: offer.canonicalUrl,
-      fingerprint,
-    });
-  }
+  let windowRecord = repo.findOpenAvailabilityWindow({
+    canonicalUrl: offer.canonicalUrl,
+    fingerprint,
+  });
   if (!windowRecord) {
     windowRecord = repo.openAvailabilityWindow({
       fingerprint,
@@ -394,7 +506,7 @@ async function processOffer({ repo, config, offer, now, fetchImpl = fetch, teleg
     });
   }
 
-  const eventsRecorded = await recordDeliveries({
+  const delivery = await recordDeliveries({
     repo,
     config,
     offer,
@@ -406,14 +518,26 @@ async function processOffer({ repo, config, offer, now, fetchImpl = fetch, teleg
     fetchImpl,
     telegramDeliveryEnabled,
   });
+  if (delivery.notificationFailed && retryOnNotificationFailure) {
+    resetAlertForRetry({
+      repo,
+      canonicalUrl: offer.canonicalUrl,
+      windowId: windowRecord.id,
+      now,
+      closeReason: 'notification_failed',
+    });
+  } else {
+    repo.saveOfferState(offer.canonicalUrl, transition.nextState);
+  }
 
   return {
     fingerprint,
     matched: true,
     alerted: true,
-    eventsRecorded,
+    eventsRecorded: delivery.eventsRecorded,
     reason: transition.reason,
     windowId: windowRecord.id,
+    canonicalUrl: offer.canonicalUrl,
   };
 }
 
@@ -539,6 +663,8 @@ async function scanOnce({ config, repo, fetchImpl = fetch, now = nowUtc8Iso(), s
       summary,
     });
     const scanItems = dedupeScanItemsPreferManual([...listingItems, ...manualItems]);
+    const manualTelegramSummaryCanConfirm =
+      config.delivery?.telegramEnabled !== false && Boolean(config.telegram?.botToken && config.telegram?.chatId);
 
     const manualOffers = [];
     const manualAlertResults = [];
@@ -561,6 +687,7 @@ async function scanOnce({ config, repo, fetchImpl = fetch, now = nowUtc8Iso(), s
         now,
         fetchImpl,
         telegramDeliveryEnabled: false,
+        retryOnNotificationFailure: !(item.isManual && manualTelegramSummaryCanConfirm),
       });
       if (result.matched) {
         summary.matchedOffers += 1;
@@ -574,14 +701,23 @@ async function scanOnce({ config, repo, fetchImpl = fetch, now = nowUtc8Iso(), s
       }
     }
 
-    summary.deliveryEvents += await recordManualTelegramSummary({
+    const pendingManualRetry = pendingManualTelegramRetry(repo);
+    const manualTelegramAlertResults = mergeAlertResults(pendingManualRetry.alertResults, manualAlertResults);
+    const manualTelegramOffers = mergeManualOffers(pendingManualRetry.manualOffers, manualOffers);
+    const manualTelegramSummary = await recordManualTelegramSummary({
       repo,
       config,
-      manualOffers,
-      alertResults: manualAlertResults,
+      manualOffers: manualTelegramOffers,
+      alertResults: manualTelegramAlertResults,
       now,
       fetchImpl,
     });
+    summary.deliveryEvents += manualTelegramSummary.eventsRecorded;
+    if (manualTelegramSummary.status === 'failed') {
+      saveManualTelegramRetry(repo, manualTelegramAlertResults, manualTelegramOffers, now);
+    } else if (pendingManualRetry.alertResults.length > 0 && manualTelegramSummary.status !== 'skipped') {
+      clearManualTelegramRetry(repo, now);
+    }
     summary.deliveryEvents += await recordPeriodicTelegramSeparator({
       repo,
       config,

@@ -102,20 +102,42 @@ function Send-DesktopNotification {
         Add-Type -AssemblyName System.Windows.Forms
         Add-Type -AssemblyName System.Drawing
 
-        $notifyIcon = New-Object System.Windows.Forms.NotifyIcon
-        $notifyIcon.Icon = [System.Drawing.SystemIcons]::Information
-        $notifyIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
-        $notifyIcon.BalloonTipTitle = $Title
-        $notifyIcon.BalloonTipText = $Message
-        $notifyIcon.Visible = $true
-        $notifyIcon.ShowBalloonTip(10000)
-        Start-Sleep -Seconds 8
-        $notifyIcon.Dispose()
+        $form = New-Object System.Windows.Forms.Form
+        $form.Text = $Title
+        $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+        $form.Size = New-Object System.Drawing.Size(720, 260)
+        $form.TopMost = $true
+        $form.MaximizeBox = $false
+        $form.MinimizeBox = $false
+        $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+
+        $label = New-Object System.Windows.Forms.Label
+        $label.AutoSize = $false
+        $label.Location = New-Object System.Drawing.Point(24, 24)
+        $label.Size = New-Object System.Drawing.Size(656, 130)
+        $label.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 11)
+        $label.Text = $Message
+
+        $button = New-Object System.Windows.Forms.Button
+        $button.Text = 'OK'
+        $button.Size = New-Object System.Drawing.Size(120, 36)
+        $button.Location = New-Object System.Drawing.Point(560, 170)
+        $button.DialogResult = [System.Windows.Forms.DialogResult]::OK
+
+        $form.Controls.Add($label)
+        $form.Controls.Add($button)
+        $form.AcceptButton = $button
+        [void] $form.ShowDialog()
+        $form.Dispose()
     }
     catch {
         try {
-            $shell = New-Object -ComObject WScript.Shell
-            $shell.Popup($Message, 10, $Title, 64) | Out-Null
+            [System.Windows.Forms.MessageBox]::Show(
+                $Message,
+                $Title,
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            ) | Out-Null
         }
         catch {
             Write-MonitorLog -Level 'WARN' -Message "Desktop notification failed: $($_.Exception.Message)"
@@ -139,8 +161,12 @@ function Send-Alert {
         return
     }
 
-    if ($Config.notifications.desktop) {
-        Send-DesktopNotification -Title $title -Message $message
+    if ($Config.notifications.openBrowser -and $OpenBrowser) {
+        Write-MonitorLog -Message "Opening browser for $($Availability.Url)"
+        Start-Process $Availability.Url
+    }
+    elseif ($Config.notifications.openBrowser) {
+        Write-MonitorLog -Message "Browser open skipped; product page was already opened for this availability window."
     }
 
     if ($Config.notifications.beep) {
@@ -156,12 +182,127 @@ function Send-Alert {
         }
     }
 
-    if ($Config.notifications.openBrowser -and $OpenBrowser) {
-        Write-MonitorLog -Message "Opening browser for $($Availability.Url)"
-        Start-Process $Availability.Url
+    if ($Config.notifications.desktop) {
+        Send-DesktopNotification -Title $title -Message $message
     }
-    elseif ($Config.notifications.openBrowser) {
-        Write-MonitorLog -Message "Browser open skipped; product page was already opened for this availability window."
+}
+
+function Get-LocalServerEventConfig {
+    param(
+        [Parameter(Mandatory = $true)] $Config
+    )
+
+    if (-not $Config.serverEvents -or $Config.serverEvents.enabled -eq $false) {
+        return $null
+    }
+
+    $baseUrl = [string] $Config.serverEvents.baseUrl
+    if ([string]::IsNullOrWhiteSpace($baseUrl)) {
+        $baseUrl = 'http://127.0.0.1:8788'
+    }
+
+    $token = [string] $Config.serverEvents.localScriptToken
+    if ([string]::IsNullOrWhiteSpace($token)) {
+        $token = [string] $env:LOCAL_SCRIPT_TOKEN
+    }
+
+    if ([string]::IsNullOrWhiteSpace($token)) {
+        Write-MonitorLog -Level 'WARN' -Message 'Server local events enabled but LOCAL_SCRIPT_TOKEN is empty.'
+        return $null
+    }
+
+    $timeoutSeconds = 5
+    if ($Config.serverEvents.timeoutSeconds) {
+        $timeoutSeconds = [int] $Config.serverEvents.timeoutSeconds
+    }
+
+    [pscustomobject]@{
+        BaseUrl        = $baseUrl.TrimEnd('/')
+        Token          = $token
+        TimeoutSeconds = $timeoutSeconds
+    }
+}
+
+function Send-LocalEventAck {
+    param(
+        [Parameter(Mandatory = $true)] $ServerConfig,
+        [Parameter(Mandatory = $true)] [int] $EventId,
+        [Parameter(Mandatory = $true)] [string] $Status,
+        [string] $ErrorMessage = $null
+    )
+
+    $headers = @{ Authorization = "Bearer $($ServerConfig.Token)" }
+    $body = @{ status = $Status }
+    if ($ErrorMessage) {
+        $body.error = $ErrorMessage
+    }
+
+    Invoke-RestMethod `
+        -Method Post `
+        -Uri "$($ServerConfig.BaseUrl)/api/local/events/$EventId/ack" `
+        -Headers $headers `
+        -ContentType 'application/json' `
+        -Body ($body | ConvertTo-Json -Depth 4) `
+        -TimeoutSec $ServerConfig.TimeoutSeconds | Out-Null
+}
+
+function ConvertTo-AvailabilityFromLocalEvent {
+    param(
+        [Parameter(Mandatory = $true)] $Event
+    )
+
+    $payload = $Event.payload
+    $url = if ($payload.canonicalUrl) { [string] $payload.canonicalUrl } else { [string] $payload.url }
+    $title = if ($payload.title) { [string] $payload.title } elseif ($payload.productLabel) { [string] $payload.productLabel } else { 'Apple Mac' }
+    [pscustomobject]@{
+        Url         = $url
+        ProductId   = [string] $payload.productId
+        Title       = $title
+        Price       = [string] $payload.price
+        IsAvailable = $true
+        Reason      = "server local event $($Event.id)"
+        CheckedAt   = (Get-Date).ToString('o')
+    }
+}
+
+function Invoke-ServerLocalEvents {
+    param(
+        [Parameter(Mandatory = $true)] $Config
+    )
+
+    $serverConfig = Get-LocalServerEventConfig -Config $Config
+    if (-not $serverConfig) {
+        return
+    }
+
+    try {
+        $headers = @{ Authorization = "Bearer $($serverConfig.Token)" }
+        $response = Invoke-RestMethod `
+            -Method Get `
+            -Uri "$($serverConfig.BaseUrl)/api/local/events" `
+            -Headers $headers `
+            -TimeoutSec $serverConfig.TimeoutSeconds
+
+        foreach ($event in @($response.events)) {
+            try {
+                $availability = ConvertTo-AvailabilityFromLocalEvent -Event $event
+                Write-MonitorLog -Level 'ALERT' -Message ("Server local event: {0} | {1}" -f $availability.Title, $availability.Url)
+                Send-Alert -Availability $availability -Config $Config -OpenBrowser $true
+                Send-LocalEventAck -ServerConfig $serverConfig -EventId ([int] $event.id) -Status 'delivered'
+            }
+            catch {
+                Write-MonitorLog -Level 'ERROR' -Message "Failed to deliver server local event $($event.id): $($_.Exception.Message)"
+                try {
+                    Send-LocalEventAck -ServerConfig $serverConfig -EventId ([int] $event.id) -Status 'failed' -ErrorMessage $_.Exception.Message
+                }
+                catch {
+                    Write-MonitorLog -Level 'WARN' -Message "Failed to acknowledge server local event $($event.id): $($_.Exception.Message)"
+                }
+            }
+        }
+    }
+    catch {
+        Write-MonitorLog -Level 'WARN' -Message "Failed to poll server local events: $($_.Exception.Message)"
     }
 }
 
@@ -174,6 +315,8 @@ function Invoke-MonitorCycle {
     $now = Get-Date
     $repeatAfter = [TimeSpan]::FromSeconds([int] $Config.repeatAlertAfterSeconds)
 
+    Invoke-ServerLocalEvents -Config $Config
+
     foreach ($product in @($Config.products)) {
         if ($product.enabled -eq $false) {
             continue
@@ -183,7 +326,8 @@ function Invoke-MonitorCycle {
             $html = Invoke-ApplePageFetch -Url $product.url -UserAgent $Config.userAgent -TimeoutSeconds ([int] $Config.requestTimeoutSeconds)
             $availability = Get-AppleProductAvailability -Html $html -Url $product.url
             $productId = $availability.ProductId
-            $previous = $state[$productId]
+            $stateKey = Get-AppleAvailabilityStateKey -Availability $availability
+            $previous = $state[$stateKey]
             $decision = Get-AppleAlertDecision `
                 -IsAvailable ([bool] $availability.IsAvailable) `
                 -PreviousState $previous `
@@ -199,8 +343,10 @@ function Invoke-MonitorCycle {
                 Send-Alert -Availability $availability -Config $Config -OpenBrowser ([bool] $decision.ShouldOpenBrowser)
             }
 
-            $state[$productId] = [ordered]@{
+            $state[$stateKey] = [ordered]@{
                 url               = $product.url
+                productId         = $productId
+                stateKey          = $stateKey
                 title             = $availability.Title
                 price             = $availability.Price
                 lastAvailable     = $availability.IsAvailable

@@ -45,6 +45,39 @@ function Get-ProductId {
     }
 }
 
+function Get-ShortHash {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Value
+    )
+
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Value)
+        $hash = $sha.ComputeHash($bytes)
+        return ([BitConverter]::ToString($hash).Replace('-', '').Substring(0, 16)).ToLowerInvariant()
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
+function Get-AppleAvailabilityStateKey {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Availability
+    )
+
+    $productId = [string] $Availability.ProductId
+    $identity = @(
+        $productId,
+        [string] $Availability.Title,
+        [string] $Availability.Price
+    ) -join '|'
+
+    return ('{0}-{1}' -f $productId, (Get-ShortHash -Value $identity)).Trim('-').ToLowerInvariant()
+}
+
 function ConvertTo-PlainText {
     param(
         [Parameter(Mandatory = $true)]
@@ -438,4 +471,4 @@ function Get-AppleProductAvailability {
     }
 }
 
-Export-ModuleMember -Function Get-AppleProductAvailability, Get-ProductId, Get-AppleAlertDecision
+Export-ModuleMember -Function Get-AppleProductAvailability, Get-ProductId, Get-AppleAlertDecision, Get-AppleAvailabilityStateKey

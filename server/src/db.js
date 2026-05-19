@@ -155,6 +155,11 @@ function migrateDatabase(db) {
     insert or ignore into schema_migrations(version, applied_at)
       values (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
   `);
+
+  const localEventColumns = db.prepare('pragma table_info(local_events)').all().map((row) => row.name);
+  if (!localEventColumns.includes('lease_until')) {
+    db.exec('alter table local_events add column lease_until text');
+  }
 }
 
 function openDatabase(dbPath, options = {}) {
@@ -247,6 +252,24 @@ function rowToAvailabilityWindow(row) {
     lastAlertChannel: row.last_alert_channel,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  };
+}
+
+function rowToLocalEvent(row) {
+  if (!row) {
+    return null;
+  }
+  return {
+    id: row.id,
+    windowId: row.window_id,
+    fingerprint: row.fingerprint,
+    eventType: row.event_type,
+    status: row.status,
+    payload: parseJson(row.payload_json, {}),
+    createdAt: row.created_at,
+    deliveredAt: row.delivered_at,
+    leaseUntil: row.lease_until,
+    error: row.error,
   };
 }
 
@@ -404,9 +427,32 @@ function createRepository(db) {
     update local_events
       set status = @status,
           delivered_at = @deliveredAt,
-          error = @error
+          error = @error,
+          lease_until = null
       where id = @id
   `);
+  const getLocalEvent = db.prepare('select * from local_events where id = ?');
+  const claimableLocalEvents = db.prepare(`
+    select * from local_events
+      where status = 'pending'
+         or (status = 'processing' and lease_until is not null and lease_until <= @now)
+      order by created_at asc, id asc
+      limit @limit
+  `);
+  const claimLocalEvent = db.prepare(`
+    update local_events
+      set status = 'processing',
+          lease_until = @leaseUntil,
+          error = null
+      where id = @id
+  `);
+  const claimLocalEventsTransaction = db.transaction(({ limit, now, leaseUntil }) => {
+    const rows = claimableLocalEvents.all({ limit, now });
+    for (const row of rows) {
+      claimLocalEvent.run({ id: row.id, leaseUntil });
+    }
+    return rows.map((row) => rowToLocalEvent(getLocalEvent.get(row.id)));
+  });
   const startScanRun = db.prepare(`
     insert into scan_runs (started_at, status, source, created_at)
       values (@startedAt, 'running', @source, @startedAt)
@@ -571,17 +617,11 @@ function createRepository(db) {
     },
 
     listLocalEvents({ limit = 100, status = 'pending' } = {}) {
-      return listLocalEvents.all({ limit, status }).map((row) => ({
-        id: row.id,
-        windowId: row.window_id,
-        fingerprint: row.fingerprint,
-        eventType: row.event_type,
-        status: row.status,
-        payload: parseJson(row.payload_json, {}),
-        createdAt: row.created_at,
-        deliveredAt: row.delivered_at,
-        error: row.error,
-      }));
+      return listLocalEvents.all({ limit, status }).map(rowToLocalEvent);
+    },
+
+    claimLocalEvents({ limit = 100, now, leaseUntil }) {
+      return claimLocalEventsTransaction({ limit, now, leaseUntil });
     },
 
     markLocalEvent(id, { status, deliveredAt, error = null }) {

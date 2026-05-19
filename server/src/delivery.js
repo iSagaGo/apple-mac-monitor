@@ -6,6 +6,7 @@ const TENCENT_SMS_ENDPOINT = 'https://sms.tencentcloudapi.com';
 const TENCENT_SMS_SERVICE = 'sms';
 const TENCENT_SMS_VERSION = '2019-07-11';
 const TELEGRAM_API_BASE_URL = 'https://api.telegram.org';
+const DEFAULT_DELIVERY_TIMEOUT_MS = 10000;
 
 function defaultProxyAgent(proxyUrl) {
   // Loaded lazily so overseas deployments without proxy keep the normal direct path.
@@ -79,6 +80,26 @@ async function parseJsonResponse(response) {
   return body;
 }
 
+async function fetchWithTimeout(fetchImpl, url, options, timeoutMs = DEFAULT_DELIVERY_TIMEOUT_MS) {
+  const parsedTimeoutMs = Math.max(1, Number(timeoutMs || DEFAULT_DELIVERY_TIMEOUT_MS));
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), parsedTimeoutMs);
+
+  try {
+    return await fetchImpl(url, {
+      ...options,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (controller.signal.aborted || error?.name === 'AbortError') {
+      throw new Error('delivery_request_timeout');
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function telegramFetchOptions({ telegram, text, createProxyAgent = defaultProxyAgent, parseMode = null }) {
   assertConfigured(telegram?.botToken, 'telegram_bot_token');
   assertConfigured(telegram?.chatId, 'telegram_chat_id');
@@ -110,11 +131,14 @@ async function sendTelegramMessage({
   fetchImpl = fetch,
   createProxyAgent = defaultProxyAgent,
   parseMode = null,
+  timeoutMs = null,
 }) {
   const apiBaseUrl = (telegram.apiBaseUrl || TELEGRAM_API_BASE_URL).replace(/\/+$/, '');
-  const response = await fetchImpl(
+  const response = await fetchWithTimeout(
+    fetchImpl,
     `${apiBaseUrl}/bot${telegram.botToken}/sendMessage`,
     telegramFetchOptions({ telegram, text, createProxyAgent, parseMode }),
+    timeoutMs ?? telegram.requestTimeoutMs,
   );
   const body = await parseJsonResponse(response);
   if (body.ok !== true) {
@@ -127,7 +151,13 @@ async function sendTelegramMessage({
   };
 }
 
-async function sendTencentSms({ sms, templateParams = [], timestamp = Math.floor(Date.now() / 1000), fetchImpl = fetch }) {
+async function sendTencentSms({
+  sms,
+  templateParams = [],
+  timestamp = Math.floor(Date.now() / 1000),
+  fetchImpl = fetch,
+  timeoutMs = null,
+}) {
   assertConfigured(sms?.secretId, 'tencent_secret_id');
   assertConfigured(sms?.secretKey, 'tencent_secret_key');
   assertConfigured(sms?.sdkAppId, 'tencent_sms_sdk_app_id');
@@ -146,19 +176,24 @@ async function sendTencentSms({ sms, templateParams = [], timestamp = Math.floor
     TemplateParamSet: templateParams.map(String),
     SessionContext: sms.sessionContext || '',
   });
-  const response = await fetchImpl(endpoint, {
-    method: 'POST',
-    headers: tencentCloudHeaders({
-      action: 'SendSms',
+  const response = await fetchWithTimeout(
+    fetchImpl,
+    endpoint,
+    {
+      method: 'POST',
+      headers: tencentCloudHeaders({
+        action: 'SendSms',
+        body,
+        endpoint,
+        secretId: sms.secretId,
+        secretKey: sms.secretKey,
+        timestamp,
+        region: sms.region,
+      }),
       body,
-      endpoint,
-      secretId: sms.secretId,
-      secretKey: sms.secretKey,
-      timestamp,
-      region: sms.region,
-    }),
-    body,
-  });
+    },
+    timeoutMs ?? sms.requestTimeoutMs,
+  );
   const result = await parseJsonResponse(response);
   if (result.Response?.Error) {
     throw new Error(`${result.Response.Error.Code}: ${result.Response.Error.Message}`);

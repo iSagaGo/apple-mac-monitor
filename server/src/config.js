@@ -134,6 +134,7 @@ function loadConfig(env = process.env, options = {}) {
       smsDryRun: parseBool(mergedEnv.SMS_DRY_RUN, true),
       telegramEnabled: parseBool(mergedEnv.TG_NOTIFY_ENABLED, true),
       localEventsEnabled: parseBool(mergedEnv.LOCAL_EVENTS_ENABLED, true),
+      requestTimeoutMs: parseIntWithDefault(mergedEnv.DELIVERY_REQUEST_TIMEOUT_MS, 10000),
     },
     sms: {
       secretId: mergedEnv.TENCENT_SECRET_ID || '',

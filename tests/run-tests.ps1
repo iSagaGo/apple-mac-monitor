@@ -108,6 +108,32 @@ Assert-Match $structuredUnavailable.Reason 'purchaseInfo' 'records structured pu
 $id = Get-ProductId -Url 'https://www.apple.com.cn/shop/product/g1cepch/a'
 Assert-Equal $id 'g1cepch-a' 'creates stable product id from Apple product URL'
 
+$sameUrlFirstKey = Get-AppleAvailabilityStateKey -Availability ([pscustomobject]@{
+        ProductId = 'g1cepch-a'
+        Title     = 'Refurbished Mac Studio Apple M3 Ultra 1TB'
+        Price     = 'RMB 63,099'
+    })
+$sameUrlSecondKey = Get-AppleAvailabilityStateKey -Availability ([pscustomobject]@{
+        ProductId = 'g1cepch-a'
+        Title     = 'Refurbished Mac Studio Apple M3 Ultra 2TB'
+        Price     = 'RMB 65,599'
+    })
+Assert-Equal ($sameUrlFirstKey -ne $sameUrlSecondKey) $true 'distinguishes different products behind the same Apple URL'
+
+$runMonitorSource = Get-Content -LiteralPath (Join-Path $repoRoot 'run-monitor.ps1') -Raw -Encoding UTF8
+Assert-Match $runMonitorSource 'ShowDialog\(' 'uses a manual-close desktop alert dialog'
+Assert-Equal ([bool] ($runMonitorSource -match 'ShowBalloonTip\(10000\)|Popup\(\$Message,\s*10')) $false 'does not use auto-closing desktop alert timers'
+Assert-Match $runMonitorSource '/api/local/events' 'polls server local events for strong local alerts'
+Assert-Match $runMonitorSource '/ack' 'acknowledges server local events after delivery'
+Assert-Match $runMonitorSource 'LOCAL_SCRIPT_TOKEN' 'supports local script token for server event polling'
+
+$startMonitorSource = Get-Content -LiteralPath (Join-Path $repoRoot 'start-monitor.ps1') -Raw -Encoding UTF8
+$stopMonitorSource = Get-Content -LiteralPath (Join-Path $repoRoot 'stop-monitor.ps1') -Raw -Encoding UTF8
+$statusMonitorSource = Get-Content -LiteralPath (Join-Path $repoRoot 'status-monitor.ps1') -Raw -Encoding UTF8
+Assert-Match $startMonitorSource 'Win32_Process' 'start script verifies monitor process command line'
+Assert-Match $stopMonitorSource 'Win32_Process' 'stop script verifies monitor process command line before stopping'
+Assert-Match $statusMonitorSource 'Win32_Process' 'status script verifies monitor process command line'
+
 $now = [DateTime]::Parse('2026-05-18T18:30:00+08:00')
 $repeatAfter = [TimeSpan]::FromSeconds(60)
 

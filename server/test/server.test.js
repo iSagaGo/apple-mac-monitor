@@ -194,13 +194,52 @@ test('HTTP local events API returns pending local events for the Windows script'
   const authorized = await fetch(`${baseUrl}/api/local/events`, {
     headers: { authorization: `Bearer ${'b'.repeat(32)}` },
   });
+  const secondAuthorized = await fetch(`${baseUrl}/api/local/events`, {
+    headers: { authorization: `Bearer ${'b'.repeat(32)}` },
+  });
   const body = await authorized.json();
+  const secondBody = await secondAuthorized.json();
 
   assert.equal(unauthorized.status, 401);
   assert.equal(authorized.status, 200);
+  assert.equal(secondAuthorized.status, 200);
   assert.equal(body.events.length, 1);
   assert.equal(body.events[0].fingerprint, 'ofp_local_test');
   assert.equal(body.events[0].payload.title, 'Mac Studio');
+  assert.equal(secondBody.events.length, 0);
+  assert.equal(db.prepare('select status from local_events where fingerprint = ?').get('ofp_local_test').status, 'processing');
+
+  server.close();
+  db.close();
+});
+
+test('HTTP local events API claims the oldest pending events first', async () => {
+  const { db, repo } = tempRepo();
+  for (let index = 0; index < 101; index += 1) {
+    const minute = Math.floor(index / 60);
+    const second = index % 60;
+    repo.recordLocalEvent({
+      windowId: null,
+      fingerprint: `ofp_order_${index}`,
+      eventType: 'availability_alert',
+      status: 'pending',
+      payload: { title: `Mac Studio ${index}` },
+      createdAt: `2026-05-18T21:${String(minute).padStart(2, '0')}:${String(second).padStart(2, '0')}.000+08:00`,
+    });
+  }
+  const server = createHttpServer({ config: testConfig(), repo });
+  const baseUrl = await listen(server);
+
+  const authorized = await fetch(`${baseUrl}/api/local/events`, {
+    headers: { authorization: `Bearer ${'b'.repeat(32)}` },
+  });
+  const body = await authorized.json();
+
+  assert.equal(authorized.status, 200);
+  assert.equal(body.events.length, 100);
+  assert.equal(body.events[0].fingerprint, 'ofp_order_0');
+  assert.equal(body.events[99].fingerprint, 'ofp_order_99');
+  assert.equal(db.prepare('select status from local_events where fingerprint = ?').get('ofp_order_100').status, 'pending');
 
   server.close();
   db.close();

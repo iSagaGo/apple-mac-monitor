@@ -8,6 +8,12 @@
     "beep": true,
     "openBrowser": true
   },
+  "serverEvents": {
+    "enabled": false,
+    "baseUrl": "http://127.0.0.1:8788",
+    "localScriptToken": "",
+    "timeoutSeconds": 5
+  },
   "products": [
     {
       "name": "Apple refurbished Mac target",

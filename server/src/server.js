@@ -7,12 +7,13 @@ const { sendTelegramMessage, sendTencentSms } = require('./delivery');
 const { canonicalizeAppleProductUrl } = require('./apple');
 const { matchesAlertRule } = require('./rules');
 const { scanOnce } = require('./scanner');
-const { nowUtc8Iso } = require('./time');
+const { nowUtc8Iso, toUtc8Iso } = require('./time');
 
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 const SESSION_COOKIE = 'apple_monitor_session';
 const SCAN_RATE_LIMIT_MS = 30_000;
 const TEST_NOTIFY_RATE_LIMIT_MS = 30_000;
+const LOCAL_EVENT_LEASE_MS = 60_000;
 const MAX_JSON_BODY_BYTES = 64 * 1024;
 
 function sha256(value) {
@@ -473,6 +474,7 @@ function createHttpServer({
           sms: config.sms,
           templateParams: smsTestParams(body, config),
           fetchImpl,
+          timeoutMs: config.delivery?.requestTimeoutMs,
         });
         sendJson(res, 200, {
           ok: true,
@@ -504,6 +506,7 @@ function createHttpServer({
           telegram: config.telegram,
           text: telegramTestMessage(body),
           fetchImpl,
+          timeoutMs: config.delivery?.requestTimeoutMs,
         });
         sendJson(res, 200, {
           ok: true,
@@ -516,7 +519,16 @@ function createHttpServer({
       }
 
       if (req.method === 'GET' && url.pathname === '/api/local/events') {
-        sendJson(res, 200, { ok: true, events: repo.listLocalEvents?.({ limit: 100, status: 'pending' }) ?? [] });
+        const claimedAt = new Date();
+        const events =
+          repo.claimLocalEvents?.({
+            limit: 100,
+            now: toUtc8Iso(claimedAt),
+            leaseUntil: toUtc8Iso(new Date(claimedAt.getTime() + LOCAL_EVENT_LEASE_MS)),
+          }) ??
+          repo.listLocalEvents?.({ limit: 100, status: 'pending' }) ??
+          [];
+        sendJson(res, 200, { ok: true, events });
         return;
       }
 

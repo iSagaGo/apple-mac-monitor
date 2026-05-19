@@ -17,6 +17,7 @@ test('loadConfig reads real SMS and Telegram delivery settings', () => {
       TENCENT_SMS_TEMPLATE_ID: '123456',
       TENCENT_SMS_PHONE_NUMBERS: '+8613800000000,+8613900000000',
       TENCENT_SMS_TEMPLATE_PARAMS: '{productLabel},{price},{productId}',
+      DELIVERY_REQUEST_TIMEOUT_MS: '7000',
       TG_NOTIFY_ENABLED: 'true',
       TG_BOT_TOKEN: 'dummy-token',
       TG_CHAT_ID: '987654321',
@@ -30,6 +31,7 @@ test('loadConfig reads real SMS and Telegram delivery settings', () => {
   );
 
   assert.equal(config.delivery.smsDryRun, false);
+  assert.equal(config.delivery.requestTimeoutMs, 7000);
   assert.deepEqual(config.sms.phoneNumbers, ['+8613800000000', '+8613900000000']);
   assert.deepEqual(config.sms.templateParams, ['{productLabel}', '{price}', '{productId}']);
   assert.equal(config.telegram.botToken, 'dummy-token');
@@ -67,6 +69,27 @@ test('sendTelegramMessage posts to the Telegram Bot API', async () => {
   });
   assert.equal(result.status, 'sent');
   assert.equal(result.providerMessageId, 12);
+});
+
+test('sendTelegramMessage aborts slow Telegram requests', async () => {
+  await assert.rejects(
+    sendTelegramMessage({
+      telegram: {
+        botToken: 'dummy-token',
+        chatId: '987654321',
+        apiBaseUrl: 'https://telegram.example.test',
+      },
+      text: 'slow TG test',
+      timeoutMs: 1,
+      fetchImpl: async (url, options) =>
+        new Promise((resolve, reject) => {
+          options.signal.addEventListener('abort', () => {
+            reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+          });
+        }),
+    }),
+    /delivery_request_timeout/,
+  );
 });
 
 test('sendTelegramMessage can request Telegram HTML parsing', async () => {
@@ -132,6 +155,31 @@ test('sendTelegramMessage attaches a proxy dispatcher only when enabled', async 
     proxyUrl: 'http://127.0.0.1:8800',
     marker: 'proxy-agent',
   });
+});
+
+test('sendTencentSms aborts slow SMS requests', async () => {
+  await assert.rejects(
+    sendTencentSms({
+      sms: {
+        secretId: 'sid',
+        secretKey: 'skey',
+        sdkAppId: '1400000000',
+        signName: 'Apple Notify',
+        templateId: '123456',
+        phoneNumbers: ['+8613800000000'],
+        endpoint: 'https://sms.tencentcloudapi.com',
+      },
+      templateParams: ['Mac Studio'],
+      timeoutMs: 1,
+      fetchImpl: async (url, options) =>
+        new Promise((resolve, reject) => {
+          options.signal.addEventListener('abort', () => {
+            reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+          });
+        }),
+    }),
+    /delivery_request_timeout/,
+  );
 });
 
 test('alertTelegramText splits manual monitored products by purchase status', () => {

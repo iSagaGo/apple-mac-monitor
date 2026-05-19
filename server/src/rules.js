@@ -138,7 +138,10 @@ function decideAvailabilityWindow({ previous = null, offer, now, repeatAlertAfte
       shouldAlert: false,
       reason: 'unknown',
       fingerprint,
-      nextState: baseNextState({ previous, offer, fingerprint, now, status: 'unknown' }),
+      nextState: {
+        ...baseNextState({ previous, offer, fingerprint, now, status: 'unknown' }),
+        windowOpen: false,
+      },
     };
   }
 
