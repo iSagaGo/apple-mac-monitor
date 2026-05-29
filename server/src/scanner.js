@@ -558,6 +558,7 @@ async function recordMonitorHealthAlert({ repo, config, summary, reasons, consec
   };
   const text = monitorHealthAlertText({ summary, reasons, consecutiveFailures, now });
   let eventsRecorded = 0;
+  const realNotificationStatuses = [];
 
   if (config.delivery?.telegramEnabled !== false) {
     let telegramStatus = 'dry_run';
@@ -577,6 +578,7 @@ async function recordMonitorHealthAlert({ repo, config, summary, reasons, consec
         telegramStatus = 'failed';
         telegramError = error.message;
       }
+      realNotificationStatuses.push(telegramStatus);
     }
 
     repo.recordTelegramEvent({
@@ -612,6 +614,7 @@ async function recordMonitorHealthAlert({ repo, config, summary, reasons, consec
         ntfyStatus = 'failed';
         ntfyError = error.message;
       }
+      realNotificationStatuses.push(ntfyStatus);
     }
 
     repo.recordNtfyEvent({
@@ -628,7 +631,9 @@ async function recordMonitorHealthAlert({ repo, config, summary, reasons, consec
     eventsRecorded += 1;
   }
 
-  if (eventsRecorded > 0) {
+  const anyRealNotificationSent = realNotificationStatuses.some((status) => status === 'sent');
+  const noRealNotificationAttempted = realNotificationStatuses.length === 0;
+  if (anyRealNotificationSent || (noRealNotificationAttempted && eventsRecorded > 0)) {
     repo.setSetting?.(MONITOR_HEALTH_LAST_ALERT_SETTING, now, now);
   }
   return eventsRecorded;

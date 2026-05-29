@@ -849,6 +849,61 @@ test('scanOnce sends cooldown-protected ntfy health alert after repeated unhealt
   db.close();
 });
 
+test('scanOnce retries ntfy health alerts after failed delivery instead of starting cooldown', async () => {
+  const manualUrl = 'https://www.apple.com.cn/shop/product/g1cepch/a';
+  const { db, repo } = tempDb();
+  const ntfyRequests = [];
+  const config = scannerConfig({
+    apple: {
+      manualUrls: [manualUrl],
+    },
+    delivery: {
+      telegramEnabled: false,
+      ntfyEnabled: true,
+    },
+    ntfy: {
+      baseUrl: 'https://ntfy.example.test',
+      topic: 'apple-openclaw-test',
+    },
+    observability: {
+      healthAlertsEnabled: true,
+      healthAlertConsecutiveFailures: 1,
+      healthAlertMinScannedOffers: 1,
+      healthAlertCooldownSeconds: 600,
+    },
+  });
+  const fetchImpl = async (url, options = {}) => {
+    if (options.method === 'POST' && String(url).includes('ntfy.example.test')) {
+      ntfyRequests.push({ url: String(url), options });
+      return { ok: false, json: async () => ({ error: 'ntfy down' }) };
+    }
+    return { ok: false, status: 503, text: async () => 'apple unavailable' };
+  };
+
+  const first = await scanOnce({
+    config,
+    repo,
+    fetchImpl,
+    now: '2026-05-18T20:00:00+08:00',
+  });
+  const second = await scanOnce({
+    config,
+    repo,
+    fetchImpl,
+    now: '2026-05-18T20:00:10+08:00',
+  });
+
+  assert.equal(first.deliveryEvents, 1);
+  assert.equal(second.deliveryEvents, 1);
+  assert.equal(ntfyRequests.length, 2);
+  assert.deepEqual(db.prepare('select status, error from ntfy_events order by id').all(), [
+    { status: 'failed', error: 'ntfy down' },
+    { status: 'failed', error: 'ntfy down' },
+  ]);
+  assert.equal(repo.getSetting('monitor_health_last_alert_at'), null);
+  db.close();
+});
+
 test('scanOnce retries manual Telegram summary after a failed send', async () => {
   const manualUrl = 'https://www.apple.com.cn/shop/product/g1ce3ch/a';
   const { db, repo } = tempDb();

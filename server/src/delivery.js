@@ -153,11 +153,22 @@ async function sendTelegramMessage({
 }
 
 async function parseOptionalJsonResponse(response) {
+  if (typeof response.text === 'function') {
+    const text = await response.text();
+    if (!text) {
+      return {};
+    }
+    try {
+      return JSON.parse(text);
+    } catch {
+      return { message: text };
+    }
+  }
+
   try {
     return await response.json();
   } catch {
-    const text = await response.text?.();
-    return text ? { message: text } : {};
+    return {};
   }
 }
 

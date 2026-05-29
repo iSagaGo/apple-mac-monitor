@@ -109,6 +109,26 @@ test('sendNtfyMessage posts a plain text message to the configured topic', async
   assert.equal(result.providerMessageId, 'msg-1');
 });
 
+test('sendNtfyMessage treats successful plain text ntfy responses as sent', async () => {
+  const result = await sendNtfyMessage({
+    ntfy: {
+      baseUrl: 'http://ntfy.example.test',
+      topic: 'apple-openclaw-test',
+    },
+    title: 'Apple monitor',
+    message: 'Mac Studio available',
+    fetchImpl: async () =>
+      new Response('ok', {
+        status: 200,
+        headers: { 'content-type': 'text/plain; charset=utf-8' },
+      }),
+  });
+
+  assert.equal(result.status, 'sent');
+  assert.equal(result.providerMessageId, null);
+  assert.deepEqual(result.response, { message: 'ok' });
+});
+
 test('alertNtfyText renders manual monitored products as readable plain text', () => {
   const text = alertNtfyText({
     detectedAt: '2026-05-18T23:20:00+08:00',
