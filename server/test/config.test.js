@@ -19,8 +19,16 @@ test('loadConfig applies Apple scan defaults and canonical sources', () => {
   assert.equal(config.apple.scanConcurrency, 2);
   assert.equal(config.apple.requestTimeoutMs, 15000);
   assert.equal(config.apple.listingEnabled, false);
+  assert.equal(config.apple.dynamicVariantsEnabled, false);
+  assert.equal(config.apple.dynamicVariantMode, 'shadow');
   assert.deepEqual(config.apple.listingUrls, ['https://www.apple.com.cn/shop/refurbished/mac/mac-studio']);
   assert.deepEqual(config.apple.manualUrls, ['https://www.apple.com.cn/shop/product/g1cepch/a']);
+  assert.equal(config.observability.scanEvidenceEnabled, false);
+  assert.equal(config.observability.scanEvidenceRetentionHours, 24);
+  assert.equal(config.observability.healthAlertsEnabled, false);
+  assert.equal(config.observability.healthAlertConsecutiveFailures, 3);
+  assert.equal(config.observability.healthAlertMinScannedOffers, 1);
+  assert.equal(config.observability.healthAlertCooldownSeconds, 1800);
 });
 
 test('loadConfig can re-enable global listing scans explicitly', () => {
@@ -78,6 +86,8 @@ test('loadConfig reads .env files without PowerShell environment variables', () 
       'APPLE_LISTING_URLS=https://www.apple.com.cn/shop/refurbished/mac/mac-studio',
       'APPLE_MANUAL_URLS=https://www.apple.com.cn/shop/product/g1cepch/a',
       'APPLE_REQUEST_TIMEOUT_MS=7000',
+      'APPLE_DYNAMIC_VARIANTS_ENABLED=true',
+      'APPLE_DYNAMIC_VARIANTS_MODE=shadow',
       'SCHEDULER_ENABLED=true',
       'SCAN_INTERVAL_SECONDS=10',
       'SMS_DRY_RUN=false',
@@ -94,6 +104,17 @@ test('loadConfig reads .env files without PowerShell environment variables', () 
       'TG_API_BASE_URL=https://telegram.example.test',
       'TG_PROXY_ENABLED=true',
       'TG_HTTP_PROXY_URL=http://127.0.0.1:8800',
+      'NTFY_NOTIFY_ENABLED=true',
+      'NTFY_BASE_URL=http://127.0.0.1:2586',
+      'NTFY_TOPIC=apple-openclaw-test',
+      'NTFY_ACCESS_TOKEN=tk_testtoken',
+      'NTFY_PRIORITY=urgent',
+      'SCAN_EVIDENCE_ENABLED=true',
+      'SCAN_EVIDENCE_RETENTION_HOURS=48',
+      'MONITOR_HEALTH_ALERTS_ENABLED=true',
+      'MONITOR_HEALTH_ALERT_CONSECUTIVE_FAILURES=2',
+      'MONITOR_HEALTH_ALERT_MIN_SCANNED_OFFERS=5',
+      'MONITOR_HEALTH_ALERT_COOLDOWN_SECONDS=600',
       '',
     ].join('\n'),
   );
@@ -103,11 +124,24 @@ test('loadConfig reads .env files without PowerShell environment variables', () 
   assert.equal(config.port, 8788);
   assert.equal(config.auth.adminToken, 'c'.repeat(32));
   assert.equal(config.apple.requestTimeoutMs, 7000);
+  assert.equal(config.apple.dynamicVariantsEnabled, true);
+  assert.equal(config.apple.dynamicVariantMode, 'shadow');
   assert.equal(config.delivery.smsDryRun, false);
   assert.deepEqual(config.sms.phoneNumbers, ['+8613800000000']);
   assert.equal(config.telegram.botToken, 'dummy-token');
   assert.equal(config.telegram.proxyEnabled, true);
   assert.equal(config.telegram.httpProxyUrl, 'http://127.0.0.1:8800');
+  assert.equal(config.delivery.ntfyEnabled, true);
+  assert.equal(config.ntfy.baseUrl, 'http://127.0.0.1:2586');
+  assert.equal(config.ntfy.topic, 'apple-openclaw-test');
+  assert.equal(config.ntfy.accessToken, 'tk_testtoken');
+  assert.equal(config.ntfy.priority, 'urgent');
+  assert.equal(config.observability.scanEvidenceEnabled, true);
+  assert.equal(config.observability.scanEvidenceRetentionHours, 48);
+  assert.equal(config.observability.healthAlertsEnabled, true);
+  assert.equal(config.observability.healthAlertConsecutiveFailures, 2);
+  assert.equal(config.observability.healthAlertMinScannedOffers, 5);
+  assert.equal(config.observability.healthAlertCooldownSeconds, 600);
 });
 
 test('loadConfig lets .env file values override environment fallback values', () => {

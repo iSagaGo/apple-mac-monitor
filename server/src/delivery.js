@@ -6,6 +6,7 @@ const TENCENT_SMS_ENDPOINT = 'https://sms.tencentcloudapi.com';
 const TENCENT_SMS_SERVICE = 'sms';
 const TENCENT_SMS_VERSION = '2019-07-11';
 const TELEGRAM_API_BASE_URL = 'https://api.telegram.org';
+const NTFY_DEFAULT_TITLE = 'Apple monitor';
 const DEFAULT_DELIVERY_TIMEOUT_MS = 10000;
 
 function defaultProxyAgent(proxyUrl) {
@@ -151,6 +152,68 @@ async function sendTelegramMessage({
   };
 }
 
+async function parseOptionalJsonResponse(response) {
+  try {
+    return await response.json();
+  } catch {
+    const text = await response.text?.();
+    return text ? { message: text } : {};
+  }
+}
+
+function ntfyFetchOptions({ ntfy, title, message }) {
+  assertConfigured(ntfy?.baseUrl, 'ntfy_base_url');
+  assertConfigured(ntfy?.topic, 'ntfy_topic');
+
+  const headers = {
+    'content-type': 'text/plain; charset=utf-8',
+    Title: title || NTFY_DEFAULT_TITLE,
+  };
+  if (ntfy.priority) {
+    headers.Priority = ntfy.priority;
+  }
+  if (Array.isArray(ntfy.tags) && ntfy.tags.length > 0) {
+    headers.Tags = ntfy.tags.join(',');
+  }
+  if (ntfy.accessToken) {
+    headers.Authorization = `Bearer ${ntfy.accessToken}`;
+  } else if (ntfy.username && ntfy.password) {
+    headers.Authorization = `Basic ${Buffer.from(`${ntfy.username}:${ntfy.password}`).toString('base64')}`;
+  }
+
+  return {
+    method: 'POST',
+    headers,
+    body: message,
+  };
+}
+
+async function sendNtfyMessage({
+  ntfy,
+  title = NTFY_DEFAULT_TITLE,
+  message,
+  fetchImpl = fetch,
+  timeoutMs = null,
+}) {
+  const baseUrl = (ntfy?.baseUrl || '').replace(/\/+$/, '');
+  const topic = encodeURIComponent(ntfy?.topic || '');
+  const response = await fetchWithTimeout(
+    fetchImpl,
+    `${baseUrl}/${topic}`,
+    ntfyFetchOptions({ ntfy, title, message }),
+    timeoutMs ?? ntfy?.requestTimeoutMs,
+  );
+  const body = await parseOptionalJsonResponse(response);
+  if (!response.ok) {
+    throw new Error(body.error || body.message || JSON.stringify(body));
+  }
+  return {
+    status: 'sent',
+    providerMessageId: body.id ?? null,
+    response: body,
+  };
+}
+
 async function sendTencentSms({
   sms,
   templateParams = [],
@@ -247,6 +310,49 @@ function renderOfferList(offers, { includeLinks = true } = {}) {
   });
 }
 
+function plainOfferDisplayName(offer = {}) {
+  const price = typeof offer.price === 'object' ? offer.price?.amount : offer.price;
+  const parts = [
+    offer.title || offer.productLabel || offer.model || offer.productId || 'Unknown product',
+    offer.memoryText || offer.memory,
+    offer.storageText || offer.storage,
+    price,
+  ].filter(Boolean);
+  return parts.join(' / ');
+}
+
+function renderPlainOfferList(offers, { includeLinks = true } = {}) {
+  if (offers.length === 0) {
+    return ['None'];
+  }
+  return offers.flatMap((offer, index) => {
+    const url = offer.canonicalUrl || offer.url || '';
+    return [
+      `${index + 1}. ${plainOfferDisplayName(offer)}`,
+      includeLinks && url ? url : null,
+    ].filter(Boolean);
+  });
+}
+
+function manualMonitorNtfyText(payload) {
+  const manualOffers = Array.isArray(payload.manualOffers) ? payload.manualOffers : [];
+  const availableOffers = manualOffers.filter((offer) => offer.availabilityStatus === 'available');
+  const unavailableOffers = manualOffers.filter((offer) => offer.availabilityStatus !== 'available');
+
+  return [
+    'Apple monitor alert',
+    payload.detectedAt ? `Time: ${formatUtc8DisplayTime(payload.detectedAt)}` : null,
+    '',
+    'Available:',
+    ...renderPlainOfferList(availableOffers),
+    '',
+    'Unavailable:',
+    ...renderPlainOfferList(unavailableOffers, { includeLinks: false }),
+  ]
+    .filter((line) => line !== null)
+    .join('\n');
+}
+
 function manualMonitorTelegramText(payload) {
   const manualOffers = Array.isArray(payload.manualOffers) ? payload.manualOffers : [];
   const availableOffers = manualOffers.filter((offer) => offer.availabilityStatus === 'available');
@@ -273,6 +379,24 @@ function telegramSeparatorText({ detectedAt, direction = 'up' } = {}) {
   return `<b>${arrow.repeat(30)}</b>`;
 }
 
+function alertNtfyText(payload) {
+  if (Array.isArray(payload.manualOffers)) {
+    return manualMonitorNtfyText(payload);
+  }
+
+  return [
+    'Apple monitor alert',
+    payload.detectedAt ? `Time: ${formatUtc8DisplayTime(payload.detectedAt)}` : null,
+    '',
+    payload.productLabel || payload.title || payload.productId || null,
+    payload.price ? `Price: ${payload.price}` : null,
+    payload.productId ? `Product: ${payload.productId}` : null,
+    payload.canonicalUrl || payload.url || null,
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
 function alertTelegramText(payload) {
   if (Array.isArray(payload.manualOffers)) {
     return manualMonitorTelegramText(payload);
@@ -292,8 +416,10 @@ function alertTelegramText(payload) {
 }
 
 module.exports = {
+  alertNtfyText,
   alertTelegramText,
   renderSmsTemplateParams,
+  sendNtfyMessage,
   sendTelegramMessage,
   sendTencentSms,
   telegramFetchOptions,

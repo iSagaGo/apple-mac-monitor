@@ -29,6 +29,11 @@ function parseOptionalNumber(value) {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
+function parseChoice(value, choices, fallback) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return choices.includes(normalized) ? normalized : fallback;
+}
+
 function requireStrongToken(name, value, localDevAuthDisabled) {
   if (localDevAuthDisabled) return value || '';
   if (!value || String(value).length < 32) {
@@ -104,6 +109,8 @@ function loadConfig(env = process.env, options = {}) {
     },
     apple: {
       listingEnabled: parseBool(mergedEnv.APPLE_LISTING_ENABLED, false),
+      dynamicVariantsEnabled: parseBool(mergedEnv.APPLE_DYNAMIC_VARIANTS_ENABLED, false),
+      dynamicVariantMode: parseChoice(mergedEnv.APPLE_DYNAMIC_VARIANTS_MODE, ['shadow', 'alert'], 'shadow'),
       listingUrls: parseCsv(mergedEnv.APPLE_LISTING_URLS, [DEFAULT_LISTING_URL]),
       manualUrls: parseCsv(mergedEnv.APPLE_MANUAL_URLS, [DEFAULT_MANUAL_URL]),
       listIntervalSeconds: parseIntWithDefault(mergedEnv.APPLE_LIST_INTERVAL_SECONDS, 45),
@@ -114,6 +121,23 @@ function loadConfig(env = process.env, options = {}) {
     scheduler: {
       enabled: parseBool(mergedEnv.SCHEDULER_ENABLED, true),
       scanIntervalSeconds: parseIntWithDefault(mergedEnv.SCAN_INTERVAL_SECONDS, 10),
+    },
+    observability: {
+      scanEvidenceEnabled: parseBool(mergedEnv.SCAN_EVIDENCE_ENABLED, false),
+      scanEvidenceRetentionHours: parseIntWithDefault(mergedEnv.SCAN_EVIDENCE_RETENTION_HOURS, 24),
+      healthAlertsEnabled: parseBool(mergedEnv.MONITOR_HEALTH_ALERTS_ENABLED, false),
+      healthAlertConsecutiveFailures: parseIntWithDefault(
+        mergedEnv.MONITOR_HEALTH_ALERT_CONSECUTIVE_FAILURES,
+        3,
+      ),
+      healthAlertMinScannedOffers: parseIntWithDefault(
+        mergedEnv.MONITOR_HEALTH_ALERT_MIN_SCANNED_OFFERS,
+        1,
+      ),
+      healthAlertCooldownSeconds: parseIntWithDefault(
+        mergedEnv.MONITOR_HEALTH_ALERT_COOLDOWN_SECONDS,
+        1800,
+      ),
     },
     alerts: {
       rules: [
@@ -133,6 +157,7 @@ function loadConfig(env = process.env, options = {}) {
     delivery: {
       smsDryRun: parseBool(mergedEnv.SMS_DRY_RUN, true),
       telegramEnabled: parseBool(mergedEnv.TG_NOTIFY_ENABLED, true),
+      ntfyEnabled: parseBool(mergedEnv.NTFY_NOTIFY_ENABLED, false),
       localEventsEnabled: parseBool(mergedEnv.LOCAL_EVENTS_ENABLED, true),
       requestTimeoutMs: parseIntWithDefault(mergedEnv.DELIVERY_REQUEST_TIMEOUT_MS, 10000),
     },
@@ -155,6 +180,15 @@ function loadConfig(env = process.env, options = {}) {
       httpProxyUrl: mergedEnv.TG_HTTP_PROXY_URL || '',
       separatorEnabled: parseBool(mergedEnv.TG_SEPARATOR_ENABLED, true),
       separatorIntervalSeconds: parseIntWithDefault(mergedEnv.TG_SEPARATOR_INTERVAL_SECONDS, 21600),
+    },
+    ntfy: {
+      baseUrl: mergedEnv.NTFY_BASE_URL || '',
+      topic: mergedEnv.NTFY_TOPIC || '',
+      accessToken: mergedEnv.NTFY_ACCESS_TOKEN || mergedEnv.NTFY_TOKEN || '',
+      username: mergedEnv.NTFY_USERNAME || '',
+      password: mergedEnv.NTFY_PASSWORD || '',
+      priority: mergedEnv.NTFY_PRIORITY || 'default',
+      tags: parseCsv(mergedEnv.NTFY_TAGS, []),
     },
   };
 }

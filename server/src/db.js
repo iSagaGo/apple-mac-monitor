@@ -104,6 +104,29 @@ function migrateDatabase(db) {
       created_at text not null
     );
 
+    create table if not exists scan_evidence (
+      id integer primary key autoincrement,
+      run_id integer,
+      source_type text not null,
+      source_url text not null,
+      canonical_url text,
+      product_id text,
+      fingerprint text,
+      availability_status text,
+      matched_rule integer not null default 0,
+      evidence_json text not null,
+      html_sha256 text,
+      created_at text not null,
+      foreign key(run_id) references scan_runs(id)
+    );
+
+    create index if not exists idx_scan_evidence_created_at
+      on scan_evidence(created_at);
+    create index if not exists idx_scan_evidence_product_id
+      on scan_evidence(product_id);
+    create index if not exists idx_scan_evidence_canonical_url
+      on scan_evidence(canonical_url);
+
     create table if not exists app_settings (
       key text primary key,
       value_json text not null,
@@ -132,6 +155,20 @@ function migrateDatabase(db) {
       idempotency_key text unique,
       status text not null,
       chat_id text,
+      payload_json text not null,
+      created_at text not null,
+      sent_at text,
+      error text,
+      foreign key(window_id) references availability_windows(id)
+    );
+
+    create table if not exists ntfy_events (
+      id integer primary key autoincrement,
+      window_id integer,
+      fingerprint text,
+      idempotency_key text unique,
+      status text not null,
+      topic text,
       payload_json text not null,
       created_at text not null,
       sent_at text,
@@ -273,6 +310,26 @@ function rowToLocalEvent(row) {
   };
 }
 
+function rowToScanEvidence(row) {
+  if (!row) {
+    return null;
+  }
+  return {
+    id: row.id,
+    runId: row.run_id,
+    sourceType: row.source_type,
+    sourceUrl: row.source_url,
+    canonicalUrl: row.canonical_url,
+    productId: row.product_id,
+    fingerprint: row.fingerprint,
+    availabilityStatus: row.availability_status,
+    matchedRule: row.matched_rule === 1,
+    evidence: parseJson(row.evidence_json, {}),
+    htmlSha256: row.html_sha256,
+    createdAt: row.created_at,
+  };
+}
+
 function createRepository(db) {
   const upsertOfferSnapshot = db.prepare(`
     insert into offer_snapshots (
@@ -369,12 +426,50 @@ function createRepository(db) {
     select
       (select count(*) from sms_events) as sms_count,
       (select count(*) from telegram_events) as telegram_count,
+      (select count(*) from ntfy_events) as ntfy_count,
       (select count(*) from local_events) as local_count
   `);
   const listScanRuns = db.prepare(`
     select * from scan_runs
       order by started_at desc, id desc
       limit @limit
+  `);
+  const recordScanEvidence = db.prepare(`
+    insert into scan_evidence (
+      run_id, source_type, source_url, canonical_url, product_id, fingerprint,
+      availability_status, matched_rule, evidence_json, html_sha256, created_at
+    ) values (
+      @runId, @sourceType, @sourceUrl, @canonicalUrl, @productId, @fingerprint,
+      @availabilityStatus, @matchedRule, @evidenceJson, @htmlSha256, @createdAt
+    )
+  `);
+  const listScanEvidence = db.prepare(`
+    select * from scan_evidence
+      order by created_at desc, id desc
+      limit @limit
+  `);
+  const listScanEvidenceByProduct = db.prepare(`
+    select * from scan_evidence
+      where product_id = @productId
+      order by created_at desc, id desc
+      limit @limit
+  `);
+  const listScanEvidenceByCanonicalUrl = db.prepare(`
+    select * from scan_evidence
+      where canonical_url = @canonicalUrl
+      order by created_at desc, id desc
+      limit @limit
+  `);
+  const listScanEvidenceByProductAndCanonicalUrl = db.prepare(`
+    select * from scan_evidence
+      where product_id = @productId
+        and canonical_url = @canonicalUrl
+      order by created_at desc, id desc
+      limit @limit
+  `);
+  const pruneScanEvidence = db.prepare(`
+    delete from scan_evidence
+      where created_at < @before
   `);
   const getSetting = db.prepare('select value_json from app_settings where key = ?');
   const setSetting = db.prepare(`
@@ -407,6 +502,15 @@ function createRepository(db) {
       payload_json, created_at, sent_at, error
     ) values (
       @windowId, @fingerprint, @idempotencyKey, @status, @chatId,
+      @payloadJson, @createdAt, @sentAt, @error
+    )
+  `);
+  const recordNtfyEvent = db.prepare(`
+    insert or ignore into ntfy_events (
+      window_id, fingerprint, idempotency_key, status, topic,
+      payload_json, created_at, sent_at, error
+    ) values (
+      @windowId, @fingerprint, @idempotencyKey, @status, @topic,
       @payloadJson, @createdAt, @sentAt, @error
     )
   `);
@@ -555,6 +659,7 @@ function createRepository(db) {
       return {
         sms: row.sms_count,
         telegram: row.telegram_count,
+        ntfy: row.ntfy_count,
         local: row.local_count,
       };
     },
@@ -572,6 +677,43 @@ function createRepository(db) {
         error: row.error,
         createdAt: row.created_at,
       }));
+    },
+
+    recordScanEvidence(evidence) {
+      recordScanEvidence.run({
+        runId: evidence.runId ?? null,
+        sourceType: evidence.sourceType,
+        sourceUrl: evidence.sourceUrl,
+        canonicalUrl: evidence.canonicalUrl ?? null,
+        productId: evidence.productId ?? null,
+        fingerprint: evidence.fingerprint ?? null,
+        availabilityStatus: evidence.availabilityStatus ?? null,
+        matchedRule: evidence.matchedRule ? 1 : 0,
+        evidenceJson: JSON.stringify(evidence.evidence ?? {}),
+        htmlSha256: evidence.htmlSha256 ?? null,
+        createdAt: evidence.createdAt,
+      });
+    },
+
+    listScanEvidence({ limit = 100, productId = null, canonicalUrl = null } = {}) {
+      if (productId && canonicalUrl) {
+        return listScanEvidenceByProductAndCanonicalUrl
+          .all({ limit, productId, canonicalUrl })
+          .map(rowToScanEvidence);
+      }
+      if (productId) {
+        return listScanEvidenceByProduct.all({ limit, productId }).map(rowToScanEvidence);
+      }
+      if (canonicalUrl) {
+        return listScanEvidenceByCanonicalUrl
+          .all({ limit, canonicalUrl })
+          .map(rowToScanEvidence);
+      }
+      return listScanEvidence.all({ limit }).map(rowToScanEvidence);
+    },
+
+    pruneScanEvidence({ before }) {
+      return pruneScanEvidence.run({ before }).changes;
     },
 
     recordSmsEvent(event) {
@@ -596,6 +738,20 @@ function createRepository(db) {
         idempotencyKey: event.idempotencyKey ?? null,
         status: event.status,
         chatId: event.chatId ?? null,
+        payloadJson: JSON.stringify(event.payload ?? {}),
+        createdAt: event.createdAt,
+        sentAt: event.sentAt ?? null,
+        error: event.error ?? null,
+      });
+    },
+
+    recordNtfyEvent(event) {
+      recordNtfyEvent.run({
+        windowId: event.windowId ?? null,
+        fingerprint: event.fingerprint ?? null,
+        idempotencyKey: event.idempotencyKey ?? null,
+        status: event.status,
+        topic: event.topic ?? null,
         payloadJson: JSON.stringify(event.payload ?? {}),
         createdAt: event.createdAt,
         sentAt: event.sentAt ?? null,

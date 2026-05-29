@@ -316,18 +316,59 @@ function extractMetaContent(html, propertyName) {
   return match ? decodeHtmlText(match[1]) : null;
 }
 
-function inferAvailabilityStatus(html, purchaseInfo) {
+function booleanOrNull(value) {
+  return typeof value === 'boolean' ? value : null;
+}
+
+function extractAddToCartButtonAttributes(html) {
+  const addToCartButton = html.match(/<button\b[^>]*data-autom=["']add-to-cart["'][^>]*>/i)?.[0];
+  return addToCartButton ? parseAttributes(addToCartButton) : null;
+}
+
+function buildAvailabilityEvidence(html, purchaseInfo) {
+  const addToCartAttributes = extractAddToCartButtonAttributes(html);
+  const addToCartButtonPresent = Boolean(addToCartAttributes);
+  const addToCartButtonDisabled = addToCartAttributes
+    ? Object.prototype.hasOwnProperty.call(addToCartAttributes, 'disabled') ||
+      /\bdisabled\b/i.test(addToCartAttributes.class || '') ||
+      String(addToCartAttributes['aria-disabled'] || '').toLowerCase() === 'true'
+    : null;
+  const purchaseInfoBuyable = booleanOrNull(purchaseInfo?.buyable);
+  const purchaseInfoIsBuyable = booleanOrNull(purchaseInfo?.isBuyable);
+  const purchaseInfoAvailability = booleanOrNull(purchaseInfo?.availability);
+  const availabilityMetricZero = /Availability\s*\|\s*0\s*\|/i.test(html);
+  let selectedSignal = 'unknown';
+
+  if (addToCartButtonPresent) {
+    selectedSignal = 'add_to_cart_button';
+  } else if (purchaseInfoIsBuyable !== null || purchaseInfoBuyable !== null) {
+    selectedSignal = 'purchase_info';
+  } else if (availabilityMetricZero) {
+    selectedSignal = 'availability_metric';
+  }
+
+  return {
+    addToCartButtonPresent,
+    addToCartButtonDisabled,
+    purchaseInfoBuyable,
+    purchaseInfoIsBuyable,
+    purchaseInfoAvailability,
+    availabilityMetricZero,
+    selectedSignal,
+  };
+}
+
+function inferAvailabilityStatus(html, purchaseInfo, evidence = buildAvailabilityEvidence(html, purchaseInfo)) {
+  const addToCartButton = html.match(/<button\b[^>]*data-autom=["']add-to-cart["'][^>]*>/i)?.[0];
+  if (addToCartButton) {
+    return evidence.addToCartButtonDisabled ? 'unavailable' : 'available';
+  }
+
   if (purchaseInfo?.isBuyable === true || purchaseInfo?.buyable === true) {
     return 'available';
   }
   if (purchaseInfo?.isBuyable === false || purchaseInfo?.buyable === false) {
     return 'unavailable';
-  }
-
-  const addToCartButton = html.match(/<button\b[^>]*data-autom=["']add-to-cart["'][^>]*>/i)?.[0];
-  if (addToCartButton) {
-    const attrs = parseAttributes(addToCartButton);
-    return Object.prototype.hasOwnProperty.call(attrs, 'disabled') ? 'unavailable' : 'available';
   }
 
   if (/Availability\s*\|\s*0\s*\|/i.test(html)) {
@@ -391,6 +432,7 @@ function parseProductDetail(html, options = {}) {
   const memory = selectedOptions.dimensionMemory?.value ?? null;
   const storage = selectedOptions.dimensionCapacity?.value ?? null;
   const price = normalizePrice(purchaseInfo.price) ?? normalizePrice(metricsProduct.price);
+  const availabilityEvidence = buildAvailabilityEvidence(html, purchaseInfo);
 
   return {
     source: 'detail',
@@ -409,7 +451,8 @@ function parseProductDetail(html, options = {}) {
     price,
     url: options.url ? toAbsoluteUrl(options.url, baseUrl) : canonicalUrl,
     canonicalUrl,
-    availabilityStatus: inferAvailabilityStatus(html, purchaseInfo),
+    availabilityStatus: inferAvailabilityStatus(html, purchaseInfo, availabilityEvidence),
+    availabilityEvidence,
     variations: parseProductVariations(pdpContent, baseUrl),
   };
 }

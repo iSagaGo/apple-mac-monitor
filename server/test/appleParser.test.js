@@ -119,6 +119,15 @@ test('parseProductDetail extracts selected Mac Studio configuration and unavaila
   assert.equal(detail.price.amount, 'RMB 92,399');
   assert.equal(detail.price.rawAmount, 92399);
   assert.equal(detail.availabilityStatus, 'unavailable');
+  assert.deepEqual(detail.availabilityEvidence, {
+    addToCartButtonPresent: true,
+    addToCartButtonDisabled: true,
+    purchaseInfoBuyable: false,
+    purchaseInfoIsBuyable: false,
+    purchaseInfoAvailability: null,
+    availabilityMetricZero: true,
+    selectedSignal: 'add_to_cart_button',
+  });
   assert.equal(detail.canonicalUrl, 'https://www.apple.com.cn/shop/product/g1cepch/a');
   assert.equal(detail.variations.length, 15);
   assert.ok(
@@ -129,6 +138,28 @@ test('parseProductDetail extracts selected Mac Studio configuration and unavaila
         variation.storage === '2tb',
     ),
   );
+});
+
+test('parseProductDetail treats an enabled add-to-cart button as available even if purchase JSON is stale', () => {
+  const html = fs
+    .readFileSync(path.join(fixturesDir, 'g1cepch-detail.html'), 'utf8')
+    .replace('class="button button-block disabled"', 'class="button button-block"')
+    .replace(' disabled="disabled" data-autom="add-to-cart"', ' data-autom="add-to-cart"');
+
+  const detail = parseProductDetail(html, {
+    url: 'https://www.apple.com.cn/shop/product/g1cepch/a',
+  });
+
+  assert.equal(detail.availabilityStatus, 'available');
+  assert.deepEqual(detail.availabilityEvidence, {
+    addToCartButtonPresent: true,
+    addToCartButtonDisabled: false,
+    purchaseInfoBuyable: false,
+    purchaseInfoIsBuyable: false,
+    purchaseInfoAvailability: null,
+    availabilityMetricZero: true,
+    selectedSignal: 'add_to_cart_button',
+  });
 });
 
 test('canonicalizeAppleProductUrl removes Apple session query while preserving product identity', () => {

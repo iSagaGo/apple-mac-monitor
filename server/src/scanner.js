@@ -1,19 +1,30 @@
+const crypto = require('node:crypto');
+
 const { canonicalizeAppleProductUrl, parseProductDetail, parseRefurbListings } = require('./apple');
 const { loadConfig } = require('./config');
 const { createRepository, openDatabase } = require('./db');
 const {
+  alertNtfyText,
   alertTelegramText,
   renderSmsTemplateParams,
+  sendNtfyMessage,
   sendTelegramMessage,
   sendTencentSms,
   telegramSeparatorText,
 } = require('./delivery');
 const { buildOfferFingerprint, decideAvailabilityWindow, matchesAlertRule } = require('./rules');
-const { nowUtc8Iso } = require('./time');
+const { nowUtc8Iso, toUtc8Iso } = require('./time');
 
 const USER_AGENT =
   'Mozilla/5.0 AppleMacMonitor/0.1 (+https://www.apple.com.cn/shop/refurbished/mac/mac-studio)';
 const MANUAL_TELEGRAM_RETRY_SETTING = 'manual_telegram_retry';
+const MONITOR_HEALTH_FAILURE_SETTING = 'monitor_health_consecutive_failures';
+const MONITOR_HEALTH_LAST_ALERT_SETTING = 'monitor_health_last_alert_at';
+const NTFY_SEPARATOR_LAST_AT_SETTING = 'ntfy_separator_last_at';
+
+function sha256Hex(value) {
+  return crypto.createHash('sha256').update(String(value)).digest('hex');
+}
 
 async function fetchHtml(url, { fetchImpl = fetch, timeoutMs = 15000 } = {}) {
   const controller = new AbortController();
@@ -151,6 +162,22 @@ function clearManualTelegramRetry(repo, now) {
   repo.setSetting?.(MANUAL_TELEGRAM_RETRY_SETTING, null, now);
 }
 
+function telegramDeliveryConfigured(config) {
+  return config.delivery?.telegramEnabled !== false && Boolean(config.telegram?.botToken && config.telegram?.chatId);
+}
+
+function ntfyDeliveryEnabled(config) {
+  return config.delivery?.ntfyEnabled === true;
+}
+
+function ntfyDeliveryConfigured(config) {
+  return ntfyDeliveryEnabled(config) && Boolean(config.ntfy?.baseUrl && config.ntfy?.topic);
+}
+
+function manualNotificationCanConfirm(config) {
+  return telegramDeliveryConfigured(config) || ntfyDeliveryConfigured(config);
+}
+
 async function recordDeliveries({
   repo,
   config,
@@ -162,6 +189,7 @@ async function recordDeliveries({
   now,
   fetchImpl,
   telegramDeliveryEnabled = true,
+  ntfyDeliveryEnabled: ntfyDirectDeliveryEnabled = true,
 }) {
   const payload = alertPayload({ offer, rule, windowRecord, transition, now });
   let eventsRecorded = 0;
@@ -258,6 +286,44 @@ async function recordDeliveries({
     eventsRecorded += 1;
   }
 
+  if (ntfyDirectDeliveryEnabled && ntfyDeliveryEnabled(config)) {
+    let ntfyStatus = 'dry_run';
+    let ntfySentAt = null;
+    let ntfyError = null;
+    const ntfyAttempted = ntfyDeliveryConfigured(config);
+    if (ntfyAttempted) {
+      try {
+        await sendNtfyMessage({
+          ntfy: config.ntfy,
+          title: 'Apple monitor',
+          message: alertNtfyText(payload),
+          fetchImpl,
+          timeoutMs: config.delivery?.requestTimeoutMs,
+        });
+        ntfyStatus = 'sent';
+        ntfySentAt = now;
+      } catch (error) {
+        ntfyStatus = 'failed';
+        ntfyError = error.message;
+      }
+      realNotificationStatuses.push(ntfyStatus);
+    }
+
+    repo.recordNtfyEvent({
+      windowId: windowRecord.id,
+      fingerprint,
+      idempotencyKey: `${windowRecord.id}:ntfy:${now}`,
+      status: ntfyStatus,
+      topic: config.ntfy?.topic ?? null,
+      payload,
+      createdAt: now,
+      sentAt: ntfySentAt,
+      error: ntfyError,
+    });
+    repo.incrementWindowAlert(windowRecord.id, { channel: 'ntfy', alertedAt: now });
+    eventsRecorded += 1;
+  }
+
   return {
     eventsRecorded,
     notificationFailed:
@@ -351,8 +417,268 @@ async function recordPeriodicTelegramSeparator({ repo, config, now, fetchImpl })
   });
 }
 
+function ntfySeparatorText({ detectedAt, direction }) {
+  const arrow = direction === 'up' ? 'UP' : 'DOWN';
+  return [
+    'Apple monitor scheduled check-in',
+    `Time: ${detectedAt}`,
+    `Direction: ${arrow}`,
+  ].join('\n');
+}
+
+async function recordNtfySeparator({ repo, config, now, fetchImpl, direction, reason }) {
+  if (!ntfyDeliveryEnabled(config)) {
+    return 0;
+  }
+
+  const payload = {
+    reason,
+    direction,
+    detectedAt: now,
+  };
+  let ntfyStatus = 'dry_run';
+  let ntfySentAt = null;
+  let ntfyError = null;
+  if (ntfyDeliveryConfigured(config)) {
+    try {
+      await sendNtfyMessage({
+        ntfy: config.ntfy,
+        title: 'Apple monitor check-in',
+        message: ntfySeparatorText({ detectedAt: now, direction }),
+        fetchImpl,
+        timeoutMs: config.delivery?.requestTimeoutMs,
+      });
+      ntfyStatus = 'sent';
+      ntfySentAt = now;
+    } catch (error) {
+      ntfyStatus = 'failed';
+      ntfyError = error.message;
+    }
+  }
+
+  repo.recordNtfyEvent({
+    windowId: null,
+    fingerprint: 'ntfy-separator',
+    idempotencyKey: `ntfy-separator:${direction}:${reason}:${now}`,
+    status: ntfyStatus,
+    topic: config.ntfy?.topic ?? null,
+    payload,
+    createdAt: now,
+    sentAt: ntfySentAt,
+    error: ntfyError,
+  });
+  if (ntfyStatus !== 'failed') {
+    repo.setSetting?.(NTFY_SEPARATOR_LAST_AT_SETTING, now, now);
+  }
+  return 1;
+}
+
+async function recordPeriodicNtfySeparator({ repo, config, now, fetchImpl }) {
+  if (!ntfyDeliveryEnabled(config) || config.telegram?.separatorEnabled === false) {
+    return 0;
+  }
+  const lastAt = repo.getSetting?.(NTFY_SEPARATOR_LAST_AT_SETTING);
+  if (lastAt) {
+    const elapsedSeconds = secondsBetweenTimestamps(lastAt, now);
+    if (elapsedSeconds !== null && elapsedSeconds < telegramSeparatorIntervalSeconds(config)) {
+      return 0;
+    }
+  }
+  return recordNtfySeparator({
+    repo,
+    config,
+    now,
+    fetchImpl,
+    direction: 'down',
+    reason: 'periodic_separator',
+  });
+}
+
+function healthAlertsEnabled(config) {
+  return config.observability?.healthAlertsEnabled === true;
+}
+
+function scanHealthReasons(summary, config) {
+  const reasons = [];
+  const minScannedOffers = Math.max(0, Number(config.observability?.healthAlertMinScannedOffers ?? 1));
+  if (summary.errors.length > 0) {
+    reasons.push(`errors:${summary.errors.length}`);
+  }
+  if (summary.scannedOffers < minScannedOffers) {
+    reasons.push(`scanned_offers_below_minimum:${summary.scannedOffers}<${minScannedOffers}`);
+  }
+  return reasons;
+}
+
+function monitorHealthAlertText({ summary, reasons, consecutiveFailures, now }) {
+  const lines = [
+    'Apple monitor health warning',
+    `detected at: ${now}`,
+    `consecutive unhealthy scans: ${consecutiveFailures}`,
+    `scanned offers: ${summary.scannedOffers}`,
+    `matched offers: ${summary.matchedOffers}`,
+    `alerts created: ${summary.alertsCreated}`,
+    '',
+    'reasons:',
+    ...reasons.map((reason) => `- ${reason}`),
+  ];
+
+  if (summary.errors.length > 0) {
+    lines.push('', 'errors:');
+    for (const error of summary.errors.slice(0, 5)) {
+      lines.push(`- ${error.url || error.productId || 'scan'}: ${error.message}`);
+    }
+  }
+
+  return lines.join('\n');
+}
+
+function healthAlertCooldownActive({ repo, config, now }) {
+  const lastAlertAt = repo.getSetting?.(MONITOR_HEALTH_LAST_ALERT_SETTING);
+  if (!lastAlertAt) {
+    return false;
+  }
+  const elapsedSeconds = secondsBetweenTimestamps(lastAlertAt, now);
+  if (elapsedSeconds === null) {
+    return false;
+  }
+  return elapsedSeconds < Math.max(1, Number(config.observability?.healthAlertCooldownSeconds ?? 1800));
+}
+
+async function recordMonitorHealthAlert({ repo, config, summary, reasons, consecutiveFailures, now, fetchImpl }) {
+  const payload = {
+    reason: 'monitor_health_warning',
+    detectedAt: now,
+    consecutiveFailures,
+    scannedOffers: summary.scannedOffers,
+    matchedOffers: summary.matchedOffers,
+    alertsCreated: summary.alertsCreated,
+    reasons,
+    errors: summary.errors,
+  };
+  const text = monitorHealthAlertText({ summary, reasons, consecutiveFailures, now });
+  let eventsRecorded = 0;
+
+  if (config.delivery?.telegramEnabled !== false) {
+    let telegramStatus = 'dry_run';
+    let telegramSentAt = null;
+    let telegramError = null;
+    if (telegramDeliveryConfigured(config)) {
+      try {
+        await sendTelegramMessage({
+          telegram: config.telegram,
+          text,
+          fetchImpl,
+          timeoutMs: config.delivery?.requestTimeoutMs,
+        });
+        telegramStatus = 'sent';
+        telegramSentAt = now;
+      } catch (error) {
+        telegramStatus = 'failed';
+        telegramError = error.message;
+      }
+    }
+
+    repo.recordTelegramEvent({
+      windowId: null,
+      fingerprint: 'monitor-health',
+      idempotencyKey: `monitor-health:telegram:${now}`,
+      status: telegramStatus,
+      chatId: config.telegram?.chatId ?? null,
+      payload,
+      createdAt: now,
+      sentAt: telegramSentAt,
+      error: telegramError,
+    });
+    eventsRecorded += 1;
+  }
+
+  if (ntfyDeliveryEnabled(config)) {
+    let ntfyStatus = 'dry_run';
+    let ntfySentAt = null;
+    let ntfyError = null;
+    if (ntfyDeliveryConfigured(config)) {
+      try {
+        await sendNtfyMessage({
+          ntfy: config.ntfy,
+          title: 'Apple monitor health',
+          message: text,
+          fetchImpl,
+          timeoutMs: config.delivery?.requestTimeoutMs,
+        });
+        ntfyStatus = 'sent';
+        ntfySentAt = now;
+      } catch (error) {
+        ntfyStatus = 'failed';
+        ntfyError = error.message;
+      }
+    }
+
+    repo.recordNtfyEvent({
+      windowId: null,
+      fingerprint: 'monitor-health',
+      idempotencyKey: `monitor-health:ntfy:${now}`,
+      status: ntfyStatus,
+      topic: config.ntfy?.topic ?? null,
+      payload,
+      createdAt: now,
+      sentAt: ntfySentAt,
+      error: ntfyError,
+    });
+    eventsRecorded += 1;
+  }
+
+  if (eventsRecorded > 0) {
+    repo.setSetting?.(MONITOR_HEALTH_LAST_ALERT_SETTING, now, now);
+  }
+  return eventsRecorded;
+}
+
+async function recordScanHealth({ repo, config, summary, now, fetchImpl }) {
+  if (!healthAlertsEnabled(config)) {
+    return 0;
+  }
+
+  const reasons = scanHealthReasons(summary, config);
+  if (reasons.length === 0) {
+    repo.setSetting?.(
+      MONITOR_HEALTH_FAILURE_SETTING,
+      { count: 0, lastHealthyAt: now, reasons: [] },
+      now,
+    );
+    return 0;
+  }
+
+  const previous = repo.getSetting?.(MONITOR_HEALTH_FAILURE_SETTING);
+  const consecutiveFailures = Number(previous?.count ?? 0) + 1;
+  repo.setSetting?.(
+    MONITOR_HEALTH_FAILURE_SETTING,
+    {
+      count: consecutiveFailures,
+      lastFailedAt: now,
+      reasons,
+    },
+    now,
+  );
+
+  const threshold = Math.max(1, Number(config.observability?.healthAlertConsecutiveFailures ?? 3));
+  if (consecutiveFailures < threshold || healthAlertCooldownActive({ repo, config, now })) {
+    return 0;
+  }
+
+  return recordMonitorHealthAlert({
+    repo,
+    config,
+    summary,
+    reasons,
+    consecutiveFailures,
+    now,
+    fetchImpl,
+  });
+}
+
 async function recordManualTelegramSummary({ repo, config, manualOffers, alertResults, now, fetchImpl }) {
-  if (config.delivery?.telegramEnabled === false || alertResults.length === 0 || manualOffers.length === 0) {
+  if (alertResults.length === 0 || manualOffers.length === 0) {
     return { eventsRecorded: 0, status: 'skipped' };
   }
 
@@ -361,52 +687,114 @@ async function recordManualTelegramSummary({ repo, config, manualOffers, alertRe
     detectedAt: now,
     manualOffers: manualOffers.map(telegramOfferPayload),
   };
-  let telegramStatus = 'dry_run';
-  let telegramSentAt = null;
-  let telegramError = null;
-  if (config.telegram?.botToken && config.telegram?.chatId) {
-    try {
-      await sendTelegramMessage({
-        telegram: config.telegram,
-        text: alertTelegramText(payload),
-        fetchImpl,
-        parseMode: 'HTML',
-        timeoutMs: config.delivery?.requestTimeoutMs,
-      });
-      telegramStatus = 'sent';
-      telegramSentAt = now;
-    } catch (error) {
-      telegramStatus = 'failed';
-      telegramError = error.message;
+  const firstAlert = alertResults.find((result) => result.windowId) ?? alertResults[0];
+  const baseIdempotencyKey = `manual-monitor-summary:${firstAlert.windowId ?? firstAlert.fingerprint}:${now}`;
+  let eventsRecorded = 0;
+  let telegramStatus = null;
+  const realNotificationStatuses = [];
+
+  if (config.delivery?.telegramEnabled !== false) {
+    telegramStatus = 'dry_run';
+    let telegramSentAt = null;
+    let telegramError = null;
+    const telegramAttempted = telegramDeliveryConfigured(config);
+    if (telegramAttempted) {
+      try {
+        await sendTelegramMessage({
+          telegram: config.telegram,
+          text: alertTelegramText(payload),
+          fetchImpl,
+          parseMode: 'HTML',
+          timeoutMs: config.delivery?.requestTimeoutMs,
+        });
+        telegramStatus = 'sent';
+        telegramSentAt = now;
+      } catch (error) {
+        telegramStatus = 'failed';
+        telegramError = error.message;
+      }
+      realNotificationStatuses.push(telegramStatus);
+    }
+
+    repo.recordTelegramEvent({
+      windowId: firstAlert.windowId ?? null,
+      fingerprint: firstAlert.fingerprint ?? null,
+      idempotencyKey: baseIdempotencyKey,
+      status: telegramStatus,
+      chatId: config.telegram?.chatId ?? null,
+      payload,
+      createdAt: now,
+      sentAt: telegramSentAt,
+      error: telegramError,
+    });
+    eventsRecorded += 1;
+
+    if (telegramStatus !== 'failed') {
+      const windowIds = new Set();
+      for (const result of alertResults) {
+        if (!result.windowId || windowIds.has(result.windowId)) {
+          continue;
+        }
+        repo.incrementWindowAlert(result.windowId, { channel: 'telegram', alertedAt: now });
+        windowIds.add(result.windowId);
+      }
     }
   }
 
-  const firstAlert = alertResults.find((result) => result.windowId) ?? alertResults[0];
-  repo.recordTelegramEvent({
-    windowId: firstAlert.windowId ?? null,
-    fingerprint: firstAlert.fingerprint ?? null,
-    idempotencyKey: `manual-monitor-summary:${firstAlert.windowId ?? firstAlert.fingerprint}:${now}`,
-    status: telegramStatus,
-    chatId: config.telegram?.chatId ?? null,
-    payload,
-    createdAt: now,
-    sentAt: telegramSentAt,
-    error: telegramError,
-  });
-
-  if (telegramStatus !== 'failed') {
-    const windowIds = new Set();
-    for (const result of alertResults) {
-      if (!result.windowId || windowIds.has(result.windowId)) {
-        continue;
+  if (ntfyDeliveryEnabled(config)) {
+    let ntfyStatus = 'dry_run';
+    let ntfySentAt = null;
+    let ntfyError = null;
+    const ntfyAttempted = ntfyDeliveryConfigured(config);
+    if (ntfyAttempted) {
+      try {
+        await sendNtfyMessage({
+          ntfy: config.ntfy,
+          title: 'Apple monitor',
+          message: alertNtfyText(payload),
+          fetchImpl,
+          timeoutMs: config.delivery?.requestTimeoutMs,
+        });
+        ntfyStatus = 'sent';
+        ntfySentAt = now;
+      } catch (error) {
+        ntfyStatus = 'failed';
+        ntfyError = error.message;
       }
-      repo.incrementWindowAlert(result.windowId, { channel: 'telegram', alertedAt: now });
-      windowIds.add(result.windowId);
+      realNotificationStatuses.push(ntfyStatus);
     }
+
+    repo.recordNtfyEvent({
+      windowId: firstAlert.windowId ?? null,
+      fingerprint: firstAlert.fingerprint ?? null,
+      idempotencyKey: `${baseIdempotencyKey}:ntfy`,
+      status: ntfyStatus,
+      topic: config.ntfy?.topic ?? null,
+      payload,
+      createdAt: now,
+      sentAt: ntfySentAt,
+      error: ntfyError,
+    });
+    eventsRecorded += 1;
+
+    if (ntfyStatus !== 'failed') {
+      const windowIds = new Set();
+      for (const result of alertResults) {
+        if (!result.windowId || windowIds.has(result.windowId)) {
+          continue;
+        }
+        repo.incrementWindowAlert(result.windowId, { channel: 'ntfy', alertedAt: now });
+        windowIds.add(result.windowId);
+      }
+    }
+  }
+
+  if (eventsRecorded === 0) {
+    return { eventsRecorded: 0, status: 'skipped' };
   }
 
   const separatorEvents =
-    telegramStatus === 'failed'
+    telegramStatus === null || telegramStatus === 'failed'
       ? 0
       : await recordTelegramSeparator({
           repo,
@@ -419,7 +807,11 @@ async function recordManualTelegramSummary({ repo, config, manualOffers, alertRe
           fingerprint: firstAlert.fingerprint ?? null,
         });
 
-  return { eventsRecorded: 1 + separatorEvents, status: telegramStatus };
+  const allRealNotificationsFailed =
+    realNotificationStatuses.length > 0 && realNotificationStatuses.every((status) => status === 'failed');
+  const anyRealNotificationSent = realNotificationStatuses.some((status) => status !== 'failed');
+  const status = allRealNotificationsFailed ? 'failed' : anyRealNotificationSent ? 'sent' : 'dry_run';
+  return { eventsRecorded: eventsRecorded + separatorEvents, status };
 }
 
 function resetAlertForRetry({ repo, canonicalUrl, windowId, now, closeReason }) {
@@ -498,6 +890,7 @@ async function processOffer({
   now,
   fetchImpl = fetch,
   telegramDeliveryEnabled = true,
+  ntfyDeliveryEnabled: ntfyDirectDeliveryEnabled = true,
   retryOnNotificationFailure = true,
   bypassAlertRules = false,
 }) {
@@ -558,6 +951,7 @@ async function processOffer({
     now,
     fetchImpl,
     telegramDeliveryEnabled,
+    ntfyDeliveryEnabled: ntfyDirectDeliveryEnabled,
   });
   if (delivery.notificationFailed && retryOnNotificationFailure) {
     resetAlertForRetry({
@@ -587,9 +981,18 @@ async function scanListingUrl({ url, config, fetchImpl }) {
     fetchImpl,
     timeoutMs: config.apple?.requestTimeoutMs,
   });
+  const htmlSha256 = sha256Hex(html);
   return parseRefurbListings(html, {
     baseUrl: 'https://www.apple.com.cn',
-  });
+  }).map((offer) => ({
+    ...offer,
+    scanEvidence: {
+      sourceType: 'listing',
+      sourceUrl: url,
+      htmlSha256,
+      listingTilePresent: true,
+    },
+  }));
 }
 
 async function scanManualUrl({ url, config, fetchImpl }) {
@@ -597,11 +1000,33 @@ async function scanManualUrl({ url, config, fetchImpl }) {
     fetchImpl,
     timeoutMs: config.apple?.requestTimeoutMs,
   });
+  return [detailOfferFromHtml({ html, url, sourceType: 'detail' })];
+}
+
+function detailOfferFromHtml({ html, url, sourceType, discoveredFrom = null }) {
   const detail = parseProductDetail(html, {
     url: canonicalizeAppleProductUrl(url, 'https://www.apple.com.cn'),
     baseUrl: 'https://www.apple.com.cn',
   });
-  return [detail];
+
+  return {
+    ...detail,
+    scanEvidence: {
+      sourceType,
+      sourceUrl: url,
+      htmlSha256: sha256Hex(html),
+      listingTilePresent: false,
+      discoveredFrom,
+    },
+  };
+}
+
+async function scanDynamicVariantUrl({ url, config, fetchImpl, discoveredFrom }) {
+  const html = await fetchHtml(url, {
+    fetchImpl,
+    timeoutMs: config.apple?.requestTimeoutMs,
+  });
+  return [detailOfferFromHtml({ html, url, sourceType: 'dynamic_variant', discoveredFrom })];
 }
 
 async function mapWithConcurrency(items, concurrency, worker) {
@@ -652,10 +1077,125 @@ function dedupeScanItemsPreferManual(scanItems) {
   return [...byKey.values(), ...passthrough];
 }
 
-async function collectScanItems({ urls, concurrency, scanner, isManual, summary }) {
-  const results = await mapWithConcurrency(urls, concurrency, async (url) => {
+function dynamicVariantsEnabled(config) {
+  return config.apple?.dynamicVariantsEnabled === true;
+}
+
+function dynamicVariantMode(config) {
+  return config.apple?.dynamicVariantMode === 'alert' ? 'alert' : 'shadow';
+}
+
+function dynamicVariantCandidatesFromManualItems(manualItems, existingKeys = new Set()) {
+  const candidatesByUrl = new Map();
+
+  for (const item of manualItems) {
+    const offer = ensureCanonicalOfferUrl(item.offer);
+    for (const variation of offer.variations || []) {
+      const url = variation.canonicalUrl || variation.url;
+      if (!url) {
+        continue;
+      }
+      const canonicalUrl = canonicalizeAppleProductUrl(url, 'https://www.apple.com.cn');
+      if (candidatesByUrl.has(canonicalUrl)) {
+        continue;
+      }
+      candidatesByUrl.set(canonicalUrl, {
+        url: canonicalUrl,
+        discoveredFrom: offer.canonicalUrl || offer.url || null,
+      });
+    }
+  }
+
+  const discovered = [...candidatesByUrl.values()];
+  const toScan = discovered.filter((candidate) => !existingKeys.has(candidate.url));
+  return { discovered, toScan };
+}
+
+function scanEvidenceEnabled(config, repo) {
+  return (
+    config.observability?.scanEvidenceEnabled === true &&
+    typeof repo.recordScanEvidence === 'function'
+  );
+}
+
+function compactScanEvidence(offer, item) {
+  return {
+    title: offer.title ?? null,
+    model: offer.model ?? null,
+    chip: offer.chip ?? null,
+    memory: offer.memory ?? null,
+    memoryText: offer.memoryText ?? null,
+    storage: offer.storage ?? null,
+    storageText: offer.storageText ?? null,
+    price: offer.price ?? null,
+    source: offer.source ?? null,
+    sourceType: offer.scanEvidence?.sourceType ?? (item.isManual ? 'detail' : 'listing'),
+    listingTilePresent: offer.scanEvidence?.listingTilePresent === true,
+    dynamicVariantShadow: item.shadowOnly === true,
+    discoveredFrom: offer.scanEvidence?.discoveredFrom ?? null,
+    availabilityEvidence: offer.availabilityEvidence ?? null,
+  };
+}
+
+function recordPassiveScanEvidence({ repo, config, runId, item, offer, result, now, summary }) {
+  if (!scanEvidenceEnabled(config, repo)) {
+    return;
+  }
+
+  try {
+    repo.recordScanEvidence({
+      runId,
+      sourceType: offer.scanEvidence?.sourceType ?? (item.isManual ? 'detail' : 'listing'),
+      sourceUrl: offer.scanEvidence?.sourceUrl ?? offer.url ?? offer.canonicalUrl,
+      canonicalUrl: offer.canonicalUrl ?? null,
+      productId: offer.productId ?? null,
+      fingerprint: result.fingerprint ?? null,
+      availabilityStatus: offer.availabilityStatus ?? 'unknown',
+      matchedRule: result.matched === true,
+      evidence: compactScanEvidence(offer, item),
+      htmlSha256: offer.scanEvidence?.htmlSha256 ?? null,
+      createdAt: now,
+    });
+  } catch (error) {
+    summary.errors.push({
+      productId: offer.productId,
+      message: `scan evidence record failed: ${error.message}`,
+    });
+  }
+}
+
+function prunePassiveScanEvidence({ repo, config, now, summary }) {
+  if (!scanEvidenceEnabled(config, repo) || typeof repo.pruneScanEvidence !== 'function') {
+    return;
+  }
+  const retentionHours = Math.max(1, Number(config.observability?.scanEvidenceRetentionHours ?? 24));
+  const nowMs = Date.parse(now);
+  if (!Number.isFinite(nowMs)) {
+    return;
+  }
+
+  try {
+    repo.pruneScanEvidence({
+      before: toUtc8Iso(new Date(nowMs - retentionHours * 60 * 60 * 1000)),
+    });
+  } catch (error) {
+    summary.errors.push({ message: `scan evidence prune failed: ${error.message}` });
+  }
+}
+
+async function collectScanItems({
+  urls,
+  concurrency,
+  scanner,
+  isManual,
+  summary,
+  itemDefaults = {},
+  errorTarget = summary.errors,
+}) {
+  const results = await mapWithConcurrency(urls, concurrency, async (source) => {
+    const url = typeof source === 'string' ? source : source.url;
     try {
-      const offers = await scanner(url);
+      const offers = await scanner(source);
       return { offers, url };
     } catch (error) {
       return { error, url };
@@ -665,10 +1205,10 @@ async function collectScanItems({ urls, concurrency, scanner, isManual, summary 
   const scanItems = [];
   for (const result of results) {
     if (result.error) {
-      summary.errors.push({ url: result.url, message: result.error.message });
+      errorTarget.push({ url: result.url, message: result.error.message });
       continue;
     }
-    scanItems.push(...result.offers.map((offer) => ({ offer, isManual })));
+    scanItems.push(...result.offers.map((offer) => ({ offer, isManual, ...itemDefaults })));
   }
   return scanItems;
 }
@@ -683,6 +1223,9 @@ async function scanOnce({ config, repo, fetchImpl = fetch, now = nowUtc8Iso(), s
     matchedOffers: 0,
     alertsCreated: 0,
     deliveryEvents: 0,
+    dynamicVariantsDiscovered: 0,
+    dynamicVariantsScanned: 0,
+    dynamicVariantErrors: [],
     errors: [],
   };
 
@@ -703,9 +1246,34 @@ async function scanOnce({ config, repo, fetchImpl = fetch, now = nowUtc8Iso(), s
       isManual: true,
       summary,
     });
-    const scanItems = dedupeScanItemsPreferManual([...listingItems, ...manualItems]);
-    const manualTelegramSummaryCanConfirm =
-      config.delivery?.telegramEnabled !== false && Boolean(config.telegram?.botToken && config.telegram?.chatId);
+    let dynamicItems = [];
+    if (dynamicVariantsEnabled(config)) {
+      const existingKeys = new Set([...listingItems, ...manualItems].map(scanItemKey).filter(Boolean));
+      const dynamicCandidates = dynamicVariantCandidatesFromManualItems(manualItems, existingKeys);
+      summary.dynamicVariantsDiscovered = dynamicCandidates.discovered.length;
+      const shadowOnly = dynamicVariantMode(config) === 'shadow';
+      dynamicItems = await collectScanItems({
+        urls: dynamicCandidates.toScan,
+        concurrency,
+        scanner: (candidate) =>
+          scanDynamicVariantUrl({
+            url: candidate.url,
+            config,
+            fetchImpl,
+            discoveredFrom: candidate.discoveredFrom,
+          }),
+        isManual: false,
+        summary,
+        itemDefaults: {
+          isDynamicVariant: true,
+          shadowOnly,
+        },
+        errorTarget: shadowOnly ? summary.dynamicVariantErrors : summary.errors,
+      });
+      summary.dynamicVariantsScanned = dynamicItems.length;
+    }
+    const scanItems = dedupeScanItemsPreferManual([...listingItems, ...dynamicItems, ...manualItems]);
+    const manualSummaryCanConfirm = manualNotificationCanConfirm(config);
 
     const manualOffers = [];
     const manualAlertResults = [];
@@ -721,16 +1289,21 @@ async function scanOnce({ config, repo, fetchImpl = fetch, now = nowUtc8Iso(), s
       }
 
       summary.scannedOffers += 1;
+      const processConfig = item.shadowOnly
+        ? { ...config, alerts: { ...(config.alerts ?? {}), rules: [] } }
+        : config;
       const result = await processOffer({
         repo,
-        config,
+        config: processConfig,
         offer,
         now,
         fetchImpl,
         telegramDeliveryEnabled: false,
-        retryOnNotificationFailure: !(item.isManual && manualTelegramSummaryCanConfirm),
-        bypassAlertRules: item.isManual,
+        ntfyDeliveryEnabled: false,
+        retryOnNotificationFailure: !(item.isManual && manualSummaryCanConfirm),
+        bypassAlertRules: item.isManual && !item.shadowOnly,
       });
+      recordPassiveScanEvidence({ repo, config, runId, item, offer, result, now, summary });
       if (result.matched) {
         summary.matchedOffers += 1;
       }
@@ -742,6 +1315,7 @@ async function scanOnce({ config, repo, fetchImpl = fetch, now = nowUtc8Iso(), s
         }
       }
     }
+    prunePassiveScanEvidence({ repo, config, now, summary });
 
     const pendingManualRetry = pendingManualTelegramRetry(repo);
     const manualTelegramAlertResults = mergeAlertResults(pendingManualRetry.alertResults, manualAlertResults);
@@ -766,6 +1340,25 @@ async function scanOnce({ config, repo, fetchImpl = fetch, now = nowUtc8Iso(), s
       now,
       fetchImpl,
     });
+    if (summary.errors.length === 0 && summary.scannedOffers > 0) {
+      summary.deliveryEvents += await recordPeriodicNtfySeparator({
+        repo,
+        config,
+        now,
+        fetchImpl,
+      });
+    }
+    try {
+      summary.deliveryEvents += await recordScanHealth({
+        repo,
+        config,
+        summary,
+        now,
+        fetchImpl,
+      });
+    } catch (error) {
+      summary.errors.push({ message: `monitor health alert failed: ${error.message}` });
+    }
 
     repo.finishScanRun?.(runId, {
       finishedAt: now,

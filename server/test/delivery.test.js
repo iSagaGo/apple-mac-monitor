@@ -2,7 +2,14 @@
 const test = require('node:test');
 
 const { loadConfig } = require('../src/config');
-const { alertTelegramText, sendTelegramMessage, sendTencentSms, telegramSeparatorText } = require('../src/delivery');
+const {
+  alertNtfyText,
+  alertTelegramText,
+  sendNtfyMessage,
+  sendTelegramMessage,
+  sendTencentSms,
+  telegramSeparatorText,
+} = require('../src/delivery');
 
 test('loadConfig reads real SMS and Telegram delivery settings', () => {
   const config = loadConfig(
@@ -69,6 +76,69 @@ test('sendTelegramMessage posts to the Telegram Bot API', async () => {
   });
   assert.equal(result.status, 'sent');
   assert.equal(result.providerMessageId, 12);
+});
+
+test('sendNtfyMessage posts a plain text message to the configured topic', async () => {
+  let request = null;
+  const result = await sendNtfyMessage({
+    ntfy: {
+      baseUrl: 'http://ntfy.example.test',
+      topic: 'apple-openclaw-test',
+      accessToken: 'tk_testtoken',
+      priority: 'urgent',
+    },
+    title: 'Apple monitor',
+    message: 'Mac Studio available',
+    fetchImpl: async (url, options) => {
+      request = { url, options };
+      return {
+        ok: true,
+        json: async () => ({ id: 'msg-1', event: 'message' }),
+      };
+    },
+  });
+
+  assert.equal(request.url, 'http://ntfy.example.test/apple-openclaw-test');
+  assert.equal(request.options.method, 'POST');
+  assert.equal(request.options.headers.Authorization, 'Bearer tk_testtoken');
+  assert.equal(request.options.headers.Title, 'Apple monitor');
+  assert.equal(request.options.headers.Priority, 'urgent');
+  assert.equal(request.options.headers['content-type'], 'text/plain; charset=utf-8');
+  assert.equal(request.options.body, 'Mac Studio available');
+  assert.equal(result.status, 'sent');
+  assert.equal(result.providerMessageId, 'msg-1');
+});
+
+test('alertNtfyText renders manual monitored products as readable plain text', () => {
+  const text = alertNtfyText({
+    detectedAt: '2026-05-18T23:20:00+08:00',
+    manualOffers: [
+      {
+        title: 'Refurbished Mac Studio M3 Ultra',
+        memoryText: '512GB',
+        storageText: '1TB',
+        price: { amount: 'RMB 63,099' },
+        canonicalUrl: 'https://www.apple.com.cn/shop/product/g1ce3ch/a',
+        availabilityStatus: 'available',
+      },
+      {
+        title: 'Refurbished Mac Studio M3 Ultra',
+        memoryText: '512GB',
+        storageText: '2TB',
+        price: { amount: 'RMB 65,599' },
+        canonicalUrl: 'https://www.apple.com.cn/shop/product/g1ce8ch/a',
+        availabilityStatus: 'unavailable',
+      },
+    ],
+  });
+
+  assert.match(text, /^Apple monitor alert/);
+  assert.match(text, /2026-05-18 23:20:00 UTC\+8/);
+  assert.match(text, /Available:/);
+  assert.match(text, /512GB \/ 1TB/);
+  assert.match(text, /https:\/\/www\.apple\.com\.cn\/shop\/product\/g1ce3ch\/a/);
+  assert.match(text, /Unavailable:/);
+  assert.match(text, /512GB \/ 2TB/);
 });
 
 test('sendTelegramMessage aborts slow Telegram requests', async () => {

@@ -50,7 +50,9 @@ test('openDatabase migrates schema and enables WAL mode', () => {
   assert.ok(tables.includes('availability_windows'));
   assert.ok(tables.includes('sms_events'));
   assert.ok(tables.includes('telegram_events'));
+  assert.ok(tables.includes('ntfy_events'));
   assert.ok(tables.includes('local_events'));
+  assert.ok(tables.includes('scan_evidence'));
   db.close();
 });
 
@@ -118,6 +120,81 @@ test('repository opens and closes availability windows', () => {
   assert.equal(windows[0].status, 'closed');
   assert.equal(windows[0].alertCount, 1);
   assert.equal(windows[0].lastAlertChannel, 'telegram');
+  db.close();
+});
+
+test('repository records ntfy delivery events and includes them in event counts', () => {
+  const db = openDatabase(tempDbPath());
+  const repo = createRepository(db);
+  const offer = macStudioOffer();
+  const fingerprint = buildOfferFingerprint(offer);
+  const windowRecord = repo.openAvailabilityWindow({
+    fingerprint,
+    canonicalUrl: offer.canonicalUrl,
+    productId: offer.productId,
+    openedAt: '2026-05-18T20:00:00+08:00',
+    openReason: 'first_available',
+  });
+
+  repo.recordNtfyEvent({
+    windowId: windowRecord.id,
+    fingerprint,
+    idempotencyKey: `${windowRecord.id}:ntfy:2026-05-18T20:00:01+08:00`,
+    status: 'sent',
+    topic: 'apple-openclaw-test',
+    payload: { productId: offer.productId },
+    createdAt: '2026-05-18T20:00:01+08:00',
+    sentAt: '2026-05-18T20:00:01+08:00',
+  });
+
+  assert.deepEqual(db.prepare('select status, topic from ntfy_events').get(), {
+    status: 'sent',
+    topic: 'apple-openclaw-test',
+  });
+  assert.equal(repo.getEventCounts().ntfy, 1);
+  db.close();
+});
+
+test('repository records, lists, and prunes passive scan evidence', () => {
+  const db = openDatabase(tempDbPath());
+  const repo = createRepository(db);
+  const offer = macStudioOffer({ availabilityStatus: 'unavailable' });
+  const fingerprint = buildOfferFingerprint(offer);
+
+  repo.recordScanEvidence({
+    runId: null,
+    sourceType: 'detail',
+    sourceUrl: offer.canonicalUrl,
+    canonicalUrl: offer.canonicalUrl,
+    productId: offer.productId,
+    fingerprint,
+    availabilityStatus: 'unavailable',
+    matchedRule: true,
+    evidence: {
+      title: offer.title,
+      availabilityEvidence: {
+        addToCartButtonPresent: true,
+        addToCartButtonDisabled: true,
+      },
+    },
+    htmlSha256: 'abc123',
+    createdAt: '2026-05-18T20:00:00+08:00',
+  });
+
+  const rows = repo.listScanEvidence({ limit: 5 });
+
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].sourceType, 'detail');
+  assert.equal(rows[0].canonicalUrl, offer.canonicalUrl);
+  assert.equal(rows[0].productId, offer.productId);
+  assert.equal(rows[0].availabilityStatus, 'unavailable');
+  assert.equal(rows[0].matchedRule, true);
+  assert.equal(rows[0].evidence.availabilityEvidence.addToCartButtonDisabled, true);
+  assert.equal(rows[0].htmlSha256, 'abc123');
+
+  const deleted = repo.pruneScanEvidence({ before: '2026-05-18T20:00:01+08:00' });
+  assert.equal(deleted, 1);
+  assert.deepEqual(repo.listScanEvidence({ limit: 5 }), []);
   db.close();
 });
 

@@ -56,6 +56,8 @@ function macStudioDetailHtml({ productId, pathProductId, available = false }) {
         .replace(/"isBuyable":false/g, '"isBuyable":true')
         .replace(/"buyable":false/g, '"buyable":true')
         .replace(/"availability":false/g, '"availability":true')
+        .replace('class="button button-block disabled"', 'class="button button-block"')
+        .replace(' disabled="disabled" data-autom="add-to-cart"', ' data-autom="add-to-cart"')
     : base;
 }
 
@@ -74,6 +76,8 @@ function scannerConfig(overrides = {}) {
     apple: {
       listingUrls: [],
       manualUrls: [],
+      dynamicVariantsEnabled: false,
+      dynamicVariantMode: 'shadow',
       requestTimeoutMs: 1000,
       ...overrides.apple,
     },
@@ -90,6 +94,7 @@ function scannerConfig(overrides = {}) {
     delivery: {
       smsDryRun: true,
       telegramEnabled: true,
+      ntfyEnabled: false,
       localEventsEnabled: true,
       ...overrides.delivery,
     },
@@ -98,6 +103,18 @@ function scannerConfig(overrides = {}) {
     },
     telegram: {
       ...overrides.telegram,
+    },
+    ntfy: {
+      ...overrides.ntfy,
+    },
+    observability: {
+      scanEvidenceEnabled: false,
+      scanEvidenceRetentionHours: 24,
+      healthAlertsEnabled: false,
+      healthAlertConsecutiveFailures: 3,
+      healthAlertMinScannedOffers: 1,
+      healthAlertCooldownSeconds: 1800,
+      ...overrides.observability,
     },
   };
 }
@@ -160,6 +177,113 @@ test('scanOnce stores unavailable manual detail without creating alerts', async 
   assert.equal(summary.alertsCreated, 0);
   assert.equal(state.status, 'unavailable');
   assert.equal(db.prepare('select count(*) as count from sms_events').get().count, 0);
+  db.close();
+});
+
+test('scanOnce records passive evidence for unavailable manual detail without creating alerts', async () => {
+  const manualUrl = 'https://www.apple.com.cn/shop/product/g1cepch/a';
+  const detailHtml = fs.readFileSync(path.join(fixturesDir, 'g1cepch-detail.html'), 'utf8');
+  const { db, repo } = tempDb();
+  const config = scannerConfig({
+    apple: { manualUrls: [manualUrl] },
+    observability: {
+      scanEvidenceEnabled: true,
+    },
+  });
+
+  const summary = await scanOnce({
+    config,
+    repo,
+    fetchImpl: fakeFetch({ [manualUrl]: detailHtml }),
+    now: '2026-05-18T20:00:00+08:00',
+  });
+  const evidenceRows = repo.listScanEvidence({ limit: 5 });
+
+  assert.equal(summary.scannedOffers, 1);
+  assert.equal(summary.matchedOffers, 1);
+  assert.equal(summary.alertsCreated, 0);
+  assert.equal(evidenceRows.length, 1);
+  assert.equal(evidenceRows[0].sourceType, 'detail');
+  assert.equal(evidenceRows[0].sourceUrl, manualUrl);
+  assert.equal(evidenceRows[0].canonicalUrl, manualUrl);
+  assert.equal(evidenceRows[0].productId, 'G1CEPCH/A');
+  assert.equal(evidenceRows[0].availabilityStatus, 'unavailable');
+  assert.equal(evidenceRows[0].matchedRule, true);
+  assert.match(evidenceRows[0].htmlSha256, /^[a-f0-9]{64}$/);
+  assert.equal(evidenceRows[0].evidence.title.includes('Mac Studio'), true);
+  assert.equal(evidenceRows[0].evidence.availabilityEvidence.addToCartButtonDisabled, true);
+  assert.equal(db.prepare('select count(*) as count from sms_events').get().count, 0);
+  db.close();
+});
+
+test('scanOnce discovers Mac Studio detail variants in shadow mode without creating alerts', async () => {
+  const manualUrl = 'https://www.apple.com.cn/shop/product/g1cepch/a';
+  const variantIds = [
+    'G1CE1CH/A',
+    'G1CE6CH/A',
+    'G1CEBCH/A',
+    'G1CEGCH/A',
+    'G1CEMCH/A',
+    'G1CE2CH/A',
+    'G1CE7CH/A',
+    'G1CECCH/A',
+    'G1CEHCH/A',
+    'G1CENCH/A',
+    'G1CE3CH/A',
+    'G1CE8CH/A',
+    'G1CEDCH/A',
+    'G1CEJCH/A',
+    'G1CEPCH/A',
+  ];
+  const responses = Object.fromEntries(
+    variantIds.map((productId) => {
+      const pathProductId = productId.split('/')[0].toLowerCase();
+      return [
+        `https://www.apple.com.cn/shop/product/${pathProductId}/a`,
+        macStudioDetailHtml({
+          productId,
+          pathProductId,
+          available: productId === 'G1CE1CH/A',
+        }),
+      ];
+    }),
+  );
+  const requestedUrls = [];
+  const { db, repo } = tempDb();
+  const config = scannerConfig({
+    apple: {
+      manualUrls: [manualUrl],
+      dynamicVariantsEnabled: true,
+      dynamicVariantMode: 'shadow',
+    },
+    observability: {
+      scanEvidenceEnabled: true,
+    },
+  });
+
+  const summary = await scanOnce({
+    config,
+    repo,
+    fetchImpl: async (url) => {
+      requestedUrls.push(url);
+      const html = responses[url];
+      return html === undefined
+        ? { ok: false, status: 404, text: async () => 'not found' }
+        : { ok: true, status: 200, text: async () => html };
+    },
+    now: '2026-05-18T20:00:00+08:00',
+  });
+  const requestedDetailUrls = new Set(requestedUrls.filter((url) => url.includes('/shop/product/')));
+
+  assert.equal(requestedDetailUrls.size, 15);
+  assert.equal(summary.dynamicVariantsDiscovered, 15);
+  assert.equal(summary.dynamicVariantsScanned, 14);
+  assert.equal(summary.scannedOffers, 15);
+  assert.equal(summary.matchedOffers, 1);
+  assert.equal(summary.alertsCreated, 0);
+  assert.equal(repo.listOfferSnapshots({ limit: 20 }).length, 15);
+  assert.equal(db.prepare("select count(*) as count from scan_evidence where source_type = 'dynamic_variant'").get().count, 14);
+  assert.equal(db.prepare('select count(*) as count from availability_windows').get().count, 0);
   db.close();
 });
 
@@ -261,6 +385,82 @@ test('processOffer alerts again when availability returns after an unknown scan'
   assert.equal(returned.alerted, true);
   assert.equal(returned.reason, 'restocked');
   assert.equal(repo.listAvailabilityWindows({ limit: 10 }).filter((window) => window.status === 'open').length, 1);
+  db.close();
+});
+
+test('scanOnce sends manual Telegram summary again when a monitored URL restocks after selling out', async () => {
+  const manualUrl = 'https://www.apple.com.cn/shop/product/g1ce3ch/a';
+  const { db, repo } = tempDb();
+  const telegramRequests = [];
+  const config = scannerConfig({
+    apple: {
+      manualUrls: [manualUrl],
+    },
+    telegram: {
+      botToken: 'dummy-token',
+      chatId: '987654321',
+      apiBaseUrl: 'https://telegram.example.test',
+      separatorEnabled: false,
+    },
+  });
+  let available = true;
+  const fetchImpl = async (url, options = {}) => {
+    if (options.method === 'POST' && String(url).includes('telegram.example.test')) {
+      telegramRequests.push(JSON.parse(options.body));
+      return { ok: true, json: async () => ({ ok: true, result: { message_id: telegramRequests.length } }) };
+    }
+    if (url === manualUrl) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () =>
+          macStudioDetailHtml({
+            productId: 'G1CE3CH/A',
+            pathProductId: 'g1ce3ch',
+            available,
+          }),
+      };
+    }
+    return { ok: false, status: 404, text: async () => 'not found' };
+  };
+
+  const first = await scanOnce({
+    config,
+    repo,
+    fetchImpl,
+    now: '2026-05-19T10:00:00+08:00',
+  });
+  available = false;
+  const soldOut = await scanOnce({
+    config,
+    repo,
+    fetchImpl,
+    now: '2026-05-19T10:01:00+08:00',
+  });
+  available = true;
+  const restocked = await scanOnce({
+    config,
+    repo,
+    fetchImpl,
+    now: '2026-05-19T10:02:00+08:00',
+  });
+  const windows = repo.listAvailabilityWindows({ limit: 10 });
+
+  assert.equal(first.alertsCreated, 1);
+  assert.equal(soldOut.alertsCreated, 0);
+  assert.equal(restocked.alertsCreated, 1);
+  assert.equal(telegramRequests.length, 2);
+  assert.match(telegramRequests[0].text, /https:\/\/www\.apple\.com\.cn\/shop\/product\/g1ce3ch\/a/);
+  assert.match(telegramRequests[1].text, /https:\/\/www\.apple\.com\.cn\/shop\/product\/g1ce3ch\/a/);
+  assert.equal(windows.length, 2);
+  assert.equal(windows[0].status, 'open');
+  assert.equal(windows[0].openReason, 'restocked');
+  assert.equal(windows[1].status, 'closed');
+  assert.equal(windows[1].closeReason, 'unavailable');
+  assert.deepEqual(db.prepare('select status from telegram_events order by id').all(), [
+    { status: 'sent' },
+    { status: 'sent' },
+  ]);
   db.close();
 });
 
@@ -429,6 +629,223 @@ test('scanOnce sends one Telegram summary for manual monitored products only', a
   assert.match(telegramRequests[1].text, /^<b>.*<\/b>$/);
   assert.equal([...telegramRequests[1].text.replace(/^<b>|<\/b>$/g, '')].length, 30);
   assert.equal(db.prepare('select count(*) as count from telegram_events').get().count, 2);
+  db.close();
+});
+
+test('scanOnce sends ntfy manual summary alongside Telegram', async () => {
+  const availableManualUrl = 'https://www.apple.com.cn/shop/product/g1ce3ch/a';
+  const unavailableManualUrl = 'https://www.apple.com.cn/shop/product/g1ce8ch/a';
+  const { db, repo } = tempDb();
+  const telegramRequests = [];
+  const ntfyRequests = [];
+  const config = scannerConfig({
+    apple: {
+      manualUrls: [availableManualUrl, unavailableManualUrl],
+    },
+    delivery: {
+      ntfyEnabled: true,
+    },
+    telegram: {
+      botToken: 'dummy-token',
+      chatId: '987654321',
+      apiBaseUrl: 'https://telegram.example.test',
+      separatorEnabled: false,
+    },
+    ntfy: {
+      baseUrl: 'https://ntfy.example.test',
+      topic: 'apple-openclaw-test',
+      accessToken: 'tk_testtoken',
+      priority: 'urgent',
+    },
+  });
+  const responses = {
+    [availableManualUrl]: macStudioDetailHtml({
+      productId: 'G1CE3CH/A',
+      pathProductId: 'g1ce3ch',
+      available: true,
+    }),
+    [unavailableManualUrl]: macStudioDetailHtml({
+      productId: 'G1CE8CH/A',
+      pathProductId: 'g1ce8ch',
+      available: false,
+    }),
+  };
+
+  const summary = await scanOnce({
+    config,
+    repo,
+    fetchImpl: async (url, options = {}) => {
+      if (options.method === 'POST' && String(url).includes('telegram.example.test')) {
+        telegramRequests.push(JSON.parse(options.body));
+        return { ok: true, json: async () => ({ ok: true, result: { message_id: telegramRequests.length } }) };
+      }
+      if (options.method === 'POST' && String(url).includes('ntfy.example.test')) {
+        ntfyRequests.push({ url: String(url), options });
+        return { ok: true, json: async () => ({ id: `ntfy-${ntfyRequests.length}` }) };
+      }
+      const html = responses[url];
+      return html === undefined
+        ? { ok: false, status: 404, text: async () => 'not found' }
+        : { ok: true, status: 200, text: async () => html };
+    },
+    now: '2026-05-18T23:20:00+08:00',
+  });
+
+  assert.equal(summary.alertsCreated, 1);
+  assert.equal(telegramRequests.length, 1);
+  assert.equal(ntfyRequests.length, 1);
+  assert.equal(ntfyRequests[0].url, 'https://ntfy.example.test/apple-openclaw-test');
+  assert.match(ntfyRequests[0].options.body, /Apple monitor alert/);
+  assert.match(ntfyRequests[0].options.body, /Available:/);
+  assert.match(ntfyRequests[0].options.body, /Unavailable:/);
+  assert.match(ntfyRequests[0].options.body, /https:\/\/www\.apple\.com\.cn\/shop\/product\/g1ce3ch\/a/);
+  assert.deepEqual(db.prepare('select status, topic from ntfy_events').all(), [
+    { status: 'sent', topic: 'apple-openclaw-test' },
+  ]);
+  db.close();
+});
+
+test('scanOnce does not retry manual summary when Telegram fails but ntfy succeeds', async () => {
+  const manualUrl = 'https://www.apple.com.cn/shop/product/g1ce3ch/a';
+  const { db, repo } = tempDb();
+  const telegramRequests = [];
+  const ntfyRequests = [];
+  const config = scannerConfig({
+    apple: {
+      manualUrls: [manualUrl],
+    },
+    delivery: {
+      localEventsEnabled: false,
+      ntfyEnabled: true,
+    },
+    telegram: {
+      botToken: 'dummy-token',
+      chatId: '987654321',
+      apiBaseUrl: 'https://telegram.example.test',
+      separatorEnabled: false,
+    },
+    ntfy: {
+      baseUrl: 'https://ntfy.example.test',
+      topic: 'apple-openclaw-test',
+      accessToken: 'tk_testtoken',
+      priority: 'urgent',
+    },
+  });
+  const responses = {
+    [manualUrl]: macStudioDetailHtml({
+      productId: 'G1CE3CH/A',
+      pathProductId: 'g1ce3ch',
+      available: true,
+    }),
+  };
+  const fetchImpl = async (url, options = {}) => {
+    if (options.method === 'POST' && String(url).includes('telegram.example.test')) {
+      telegramRequests.push(JSON.parse(options.body));
+      return { ok: true, json: async () => ({ ok: false, description: 'telegram down' }) };
+    }
+    if (options.method === 'POST' && String(url).includes('ntfy.example.test')) {
+      ntfyRequests.push({ url: String(url), body: options.body });
+      return { ok: true, json: async () => ({ id: `ntfy-${ntfyRequests.length}` }) };
+    }
+    const html = responses[url];
+    return html === undefined
+      ? { ok: false, status: 404, text: async () => 'not found' }
+      : { ok: true, status: 200, text: async () => html };
+  };
+
+  const first = await scanOnce({
+    config,
+    repo,
+    fetchImpl,
+    now: '2026-05-18T23:20:00+08:00',
+  });
+  const second = await scanOnce({
+    config,
+    repo,
+    fetchImpl,
+    now: '2026-05-18T23:20:10+08:00',
+  });
+
+  assert.equal(first.alertsCreated, 1);
+  assert.equal(second.alertsCreated, 0);
+  assert.equal(telegramRequests.length, 1);
+  assert.equal(ntfyRequests.length, 1);
+  assert.deepEqual(db.prepare('select status from telegram_events order by id').all(), [{ status: 'failed' }]);
+  assert.deepEqual(db.prepare('select status from ntfy_events order by id').all(), [{ status: 'sent' }]);
+  assert.equal(repo.getSetting('manual_telegram_retry'), null);
+  db.close();
+});
+
+test('scanOnce sends cooldown-protected ntfy health alert after repeated unhealthy scans', async () => {
+  const manualUrl = 'https://www.apple.com.cn/shop/product/g1cepch/a';
+  const { db, repo } = tempDb();
+  const ntfyRequests = [];
+  const config = scannerConfig({
+    apple: {
+      manualUrls: [manualUrl],
+    },
+    delivery: {
+      telegramEnabled: false,
+      ntfyEnabled: true,
+    },
+    ntfy: {
+      baseUrl: 'https://ntfy.example.test',
+      topic: 'apple-openclaw-test',
+      priority: 'urgent',
+    },
+    observability: {
+      healthAlertsEnabled: true,
+      healthAlertConsecutiveFailures: 2,
+      healthAlertMinScannedOffers: 1,
+      healthAlertCooldownSeconds: 600,
+    },
+  });
+  const fetchImpl = async (url, options = {}) => {
+    if (options.method === 'POST' && String(url).includes('ntfy.example.test')) {
+      ntfyRequests.push({ url: String(url), options });
+      return { ok: true, json: async () => ({ id: `ntfy-${ntfyRequests.length}` }) };
+    }
+    return { ok: false, status: 503, text: async () => 'apple unavailable' };
+  };
+
+  const first = await scanOnce({
+    config,
+    repo,
+    fetchImpl,
+    now: '2026-05-18T20:00:00+08:00',
+  });
+  const second = await scanOnce({
+    config,
+    repo,
+    fetchImpl,
+    now: '2026-05-18T20:00:10+08:00',
+  });
+  const third = await scanOnce({
+    config,
+    repo,
+    fetchImpl,
+    now: '2026-05-18T20:00:20+08:00',
+  });
+
+  assert.equal(first.alertsCreated, 0);
+  assert.equal(second.alertsCreated, 0);
+  assert.equal(third.alertsCreated, 0);
+  assert.equal(first.deliveryEvents, 0);
+  assert.equal(second.deliveryEvents, 1);
+  assert.equal(third.deliveryEvents, 0);
+  assert.equal(ntfyRequests.length, 1);
+  assert.equal(ntfyRequests[0].url, 'https://ntfy.example.test/apple-openclaw-test');
+  assert.match(ntfyRequests[0].options.body, /Apple monitor health warning/);
+  assert.match(ntfyRequests[0].options.body, /consecutive unhealthy scans: 2/i);
+  assert.deepEqual(db.prepare('select status, topic from ntfy_events').all(), [
+    { status: 'sent', topic: 'apple-openclaw-test' },
+  ]);
+  assert.deepEqual(repo.getSetting('monitor_health_consecutive_failures'), {
+    count: 3,
+    lastFailedAt: '2026-05-18T20:00:20+08:00',
+    reasons: ['errors:1', 'scanned_offers_below_minimum:0<1'],
+  });
+  assert.equal(repo.getSetting('monitor_health_last_alert_at'), '2026-05-18T20:00:10+08:00');
   db.close();
 });
 
@@ -1048,6 +1465,131 @@ test('scanOnce sends a Telegram separator after alerts and then every configured
   assert.equal([...telegramRequests[2].text.replace(/^<b>|<\/b>$/g, '')].length, 30);
   assert.equal(repo.getSetting('telegram_separator_last_at'), '2026-05-19T05:20:00+08:00');
   assert.equal(db.prepare('select count(*) as count from telegram_events').get().count, 3);
+  db.close();
+});
+
+test('scanOnce mirrors periodic separator check-ins to ntfy', async () => {
+  const manualUrl = 'https://www.apple.com.cn/shop/product/g1ce3ch/a';
+  const { db, repo } = tempDb();
+  const ntfyRequests = [];
+  const config = scannerConfig({
+    apple: {
+      manualUrls: [manualUrl],
+    },
+    delivery: {
+      telegramEnabled: false,
+      ntfyEnabled: true,
+    },
+    telegram: {
+      separatorEnabled: true,
+      separatorIntervalSeconds: 21600,
+    },
+    ntfy: {
+      baseUrl: 'https://ntfy.example.test',
+      topic: 'apple-openclaw-test',
+      priority: 'urgent',
+    },
+  });
+  const responses = {
+    [manualUrl]: macStudioDetailHtml({
+      productId: 'G1CE3CH/A',
+      pathProductId: 'g1ce3ch',
+      available: false,
+    }),
+  };
+  const fetchImpl = async (url, options = {}) => {
+    if (options.method === 'POST' && String(url).includes('ntfy.example.test')) {
+      ntfyRequests.push({ url: String(url), options });
+      return { ok: true, json: async () => ({ id: `ntfy-${ntfyRequests.length}` }) };
+    }
+    const html = responses[url];
+    return html === undefined
+      ? { ok: false, status: 404, text: async () => 'not found' }
+      : { ok: true, status: 200, text: async () => html };
+  };
+
+  repo.setSetting('ntfy_separator_last_at', '2026-05-18T23:20:00+08:00', '2026-05-18T23:20:00+08:00');
+  const summary = await scanOnce({
+    config,
+    repo,
+    fetchImpl,
+    now: '2026-05-19T05:20:00+08:00',
+  });
+
+  assert.equal(summary.alertsCreated, 0);
+  assert.equal(summary.deliveryEvents, 1);
+  assert.equal(ntfyRequests.length, 1);
+  assert.equal(ntfyRequests[0].url, 'https://ntfy.example.test/apple-openclaw-test');
+  assert.match(ntfyRequests[0].options.body, /Apple monitor scheduled check-in/);
+  assert.deepEqual(db.prepare('select status, topic from ntfy_events order by id').all(), [
+    { status: 'sent', topic: 'apple-openclaw-test' },
+  ]);
+  assert.equal(repo.getSetting('ntfy_separator_last_at'), '2026-05-19T05:20:00+08:00');
+  db.close();
+});
+
+test('scanOnce does not let a recent Telegram separator suppress the first ntfy check-in', async () => {
+  const manualUrl = 'https://www.apple.com.cn/shop/product/g1ce3ch/a';
+  const { db, repo } = tempDb();
+  const ntfyRequests = [];
+  const config = scannerConfig({
+    apple: {
+      manualUrls: [manualUrl],
+    },
+    delivery: {
+      telegramEnabled: false,
+      ntfyEnabled: true,
+    },
+    telegram: {
+      separatorEnabled: true,
+      separatorIntervalSeconds: 21600,
+    },
+    ntfy: {
+      baseUrl: 'https://ntfy.example.test',
+      topic: 'apple-openclaw-test',
+    },
+  });
+  const responses = {
+    [manualUrl]: macStudioDetailHtml({
+      productId: 'G1CE3CH/A',
+      pathProductId: 'g1ce3ch',
+      available: false,
+    }),
+  };
+  const fetchImpl = async (url, options = {}) => {
+    if (options.method === 'POST' && String(url).includes('ntfy.example.test')) {
+      ntfyRequests.push({ url: String(url), options });
+      return { ok: true, json: async () => ({ id: `ntfy-${ntfyRequests.length}` }) };
+    }
+    const html = responses[url];
+    return html === undefined
+      ? { ok: false, status: 404, text: async () => 'not found' }
+      : { ok: true, status: 200, text: async () => html };
+  };
+
+  repo.setSetting('telegram_separator_last_at', '2026-05-19T05:20:00+08:00', '2026-05-19T05:20:00+08:00');
+  const first = await scanOnce({
+    config,
+    repo,
+    fetchImpl,
+    now: '2026-05-19T05:20:00+08:00',
+  });
+  const second = await scanOnce({
+    config,
+    repo,
+    fetchImpl,
+    now: '2026-05-19T05:20:10+08:00',
+  });
+
+  assert.equal(first.deliveryEvents, 1);
+  assert.equal(second.deliveryEvents, 0);
+  assert.equal(ntfyRequests.length, 1);
+  assert.match(ntfyRequests[0].options.body, /Apple monitor scheduled check-in/);
+  assert.deepEqual(db.prepare('select status, topic from ntfy_events order by id').all(), [
+    { status: 'sent', topic: 'apple-openclaw-test' },
+  ]);
+  assert.equal(repo.getSetting('telegram_separator_last_at'), '2026-05-19T05:20:00+08:00');
+  assert.equal(repo.getSetting('ntfy_separator_last_at'), '2026-05-19T05:20:00+08:00');
   db.close();
 });
 
